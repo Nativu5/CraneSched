@@ -79,6 +79,7 @@ CraneErr CranedStub::ExecuteTasks(
     mutable_task->set_uid(task->uid);
     mutable_task->set_env(task->env);
     mutable_task->set_cwd(task->cwd);
+    mutable_task->set_docker_compose_file(task->docker_compose_file);
 
     for (const auto &hostname : task->CranedIds())
       mutable_task->mutable_allocated_nodes()->Add()->assign(hostname);

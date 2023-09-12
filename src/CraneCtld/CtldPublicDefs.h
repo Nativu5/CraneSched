@@ -212,6 +212,7 @@ struct TaskInCtld {
   std::string cmd_line;
   std::string env;
   std::string cwd;
+  std::string docker_compose_file;
 
   std::variant<InteractiveMetaInTask, BatchMetaInTask> meta;
 
@@ -395,6 +396,8 @@ struct TaskInCtld {
     env = val.env();
     cwd = val.cwd();
     qos = val.qos();
+
+    docker_compose_file = val.docker_compose_file();
   }
 
   void SetFieldsByPersistedPart(

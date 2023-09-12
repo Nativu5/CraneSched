@@ -718,6 +718,16 @@ void TaskManager::EvGrpcExecuteTaskCb_(int, short events, void* user_data) {
     auto [iter, _] = this_->m_task_map_.emplace(instance->task.task_id(),
                                                 std::move(popped_instance));
 
+    // Return Success if Docker
+    // TODO: Implement Docker execution
+    std::string compose_file = instance->task.docker_compose_file();
+    if (!compose_file.empty()) {
+      CRANE_WARN("Unimplemented Docker execution, task #{}", instance->task.task_id());
+      this_->EvActivateTaskStatusChange_(instance->task.task_id(), crane::grpc::TaskStatus::Completed,
+                                         0, std::nullopt);
+      return;
+    }
+
     g_thread_pool->push_task([this_, instance]() {
       this_->m_mtx_.Lock();
 

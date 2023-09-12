@@ -98,8 +98,10 @@ message TaskToCtld {
   string cwd = 32; // Current working directory
   string env = 33;
 
-  repeated string excludes = 34;
-  repeated string nodelist = 35;
+  string docker_compose_file = 34;
+
+  repeated string excludes = 35;
+  repeated string nodelist = 36;
 }
 
 message TaskInEmbeddedDb {
@@ -161,6 +163,7 @@ message TaskToD {
   uint32 node_num = 21;
   uint32 ntasks_per_node = 22;
   double cpus_per_task = 23;
+  string docker_compose_file = 24;
 }
 
 message BatchTaskAdditionalMeta {
