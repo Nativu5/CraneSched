@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -44,7 +46,7 @@ class CforedStreamWriter {
 
   bool WriteTaskIdReply(
       pid_t calloc_pid,
-      result::result<std::future<task_id_t>, std::string> res) {
+      result::result<task_id_t, std::string> res) {
     LockGuard guard(&m_stream_mtx_);
     if (!m_valid_) return false;
 
@@ -54,7 +56,7 @@ class CforedStreamWriter {
     if (res.has_value()) {
       task_id_reply->set_ok(true);
       task_id_reply->set_pid(calloc_pid);
-      task_id_reply->set_task_id(res.value().get());
+      task_id_reply->set_task_id(res.value());
     } else {
       task_id_reply->set_ok(false);
       task_id_reply->set_pid(calloc_pid);
@@ -65,7 +67,7 @@ class CforedStreamWriter {
   }
 
   bool WriteTaskResAllocReply(task_id_t task_id,
-                              result::result<std::string, std::string> res) {
+                              result::result<std::pair<std::string,std::list<std::string>>, std::string> res) {
     LockGuard guard(&m_stream_mtx_);
     if (!m_valid_) return false;
 
@@ -76,7 +78,8 @@ class CforedStreamWriter {
 
     if (res.has_value()) {
       task_res_alloc_reply->set_ok(true);
-      task_res_alloc_reply->set_allocated_craned_regex(std::move(res.value()));
+      task_res_alloc_reply->set_allocated_craned_regex(std::move(res.value().first));
+      std::ranges::for_each(res.value().second,[&task_res_alloc_reply](const auto& craned_id){task_res_alloc_reply->add_craned_ids(craned_id);});
     } else {
       task_res_alloc_reply->set_ok(false);
       task_res_alloc_reply->set_failure_reason(std::move(res.error()));
@@ -88,7 +91,7 @@ class CforedStreamWriter {
   bool WriteTaskCompletionAckReply(task_id_t task_id) {
     LockGuard guard(&m_stream_mtx_);
     if (!m_valid_) return false;
-
+    CRANE_TRACE("Sending TaskCompletionAckReply to cfored of task id {}",task_id);
     StreamCtldReply reply;
     reply.set_type(StreamCtldReply::TASK_COMPLETION_ACK_REPLY);
 
@@ -155,7 +158,7 @@ class CforedStreamWriter {
 
   grpc::ServerReaderWriter<crane::grpc::StreamCtldReply,
                            crane::grpc::StreamCforedRequest> *m_stream_
-      GUARDED_BY(m_stream_mtx_);
+      ABSL_GUARDED_BY(m_stream_mtx_);
 };
 
 class CtldServer;
@@ -213,6 +216,11 @@ class CraneCtldServiceImpl final : public crane::grpc::CraneCtld::Service {
   grpc::Status ModifyTask(grpc::ServerContext *context,
                           const crane::grpc::ModifyTaskRequest *request,
                           crane::grpc::ModifyTaskReply *response) override;
+
+  grpc::Status ModifyNode(
+      grpc::ServerContext *context,
+      const crane::grpc::ModifyCranedStateRequest *request,
+      crane::grpc::ModifyCranedStateReply *response) override;
 
   grpc::Status AddAccount(grpc::ServerContext *context,
                           const crane::grpc::AddAccountRequest *request,
@@ -284,7 +292,7 @@ class CtldServer {
 
   Mutex m_mtx_;
   HashMap<std::string /* cfored_name */, HashSet<task_id_t>>
-      m_cfored_running_tasks_ GUARDED_BY(m_mtx_);
+      m_cfored_running_tasks_ ABSL_GUARDED_BY(m_mtx_);
 
   inline static std::mutex s_sigint_mtx;
   inline static std::condition_variable s_sigint_cv;

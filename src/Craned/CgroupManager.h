@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 /*
@@ -23,24 +25,13 @@
  */
 #pragma once
 
-#include <absl/container/flat_hash_map.h>
-#include <absl/synchronization/mutex.h>
 #include <libcgroup.h>
-#include <pthread.h>
 
-#include <array>
-#include <cassert>
-#include <map>
-#include <optional>
-#include <string_view>
+#include "CranedPublicDefs.h"
+#include "crane/AtomicHashMap.h"
+#include "crane/OS.h"
 
-#include "crane/Lock.h"
-#include "crane/Logger.h"
-#include "crane/PublicHeader.h"
-
-namespace util {
-
-class CgroupManager;  // Forward Declaration
+namespace Craned {
 
 namespace CgroupConstant {
 
@@ -71,6 +62,8 @@ enum class ControllerFile : uint64_t {
 
   ControllerFileCount
 };
+
+inline const char *kTaskCgPathPrefix = "Crane_Task_";
 
 namespace Internal {
 
@@ -197,7 +190,7 @@ const ControllerFlags NO_CONTROLLER_FLAG{};
 
 // In many distributions, 'cpu' and 'cpuacct' are mounted together. 'cpu'
 //  and 'cpuacct' both point to a single 'cpu,cpuacct' account. libcgroup
-//  handles this for us and no additional care needs to be take.
+//  handles this for us and no additional care needs to be taken.
 const ControllerFlags ALL_CONTROLLER_FLAG = (~NO_CONTROLLER_FLAG);
 
 class Cgroup {
@@ -219,13 +212,17 @@ class Cgroup {
   bool SetMemorySwLimitBytes(uint64_t mem_bytes);
   bool SetMemorySoftLimitBytes(uint64_t memory_bytes);
   bool SetBlockioWeight(uint64_t weight);
+  bool SetDeviceAccess(const std::unordered_set<SlotId> &devices, bool set_read,
+                       bool set_write, bool set_mknod);
   bool SetControllerValue(CgroupConstant::Controller controller,
                           CgroupConstant::ControllerFile controller_file,
                           uint64_t value);
   bool SetControllerStr(CgroupConstant::Controller controller,
                         CgroupConstant::ControllerFile controller_file,
                         const std::string &str);
-
+  bool SetControllerStrs(CgroupConstant::Controller controller,
+                         CgroupConstant::ControllerFile controller_file,
+                         const std::vector<std::string> &strs);
   bool KillAllProcesses();
 
   bool Empty();
@@ -237,29 +234,82 @@ class Cgroup {
 
   std::string m_cgroup_path_;
   mutable struct cgroup *m_cgroup_;
-
-  friend class CgroupManager;
 };
 
-class CgroupUtil {
+class AllocatableResourceAllocator {
  public:
-  static int Init();
+  static bool Allocate(const AllocatableResource &resource, Cgroup *cg);
+  static bool Allocate(const crane::grpc::AllocatableResource &resource,
+                       Cgroup *cg);
+};
 
-  static bool Mounted(CgroupConstant::Controller controller) {
+class DedicatedResourceAllocator {
+ public:
+  static bool Allocate(
+      const crane::grpc::DedicatedResourceInNode &request_resource, Cgroup *cg);
+};
+
+class CgroupManager {
+ public:
+  int Init();
+
+  bool Mounted(CgroupConstant::Controller controller) {
     return bool(m_mounted_controllers_ & ControllerFlags{controller});
   }
 
-  static std::unique_ptr<Cgroup> CreateOrOpen(
-      const std::string &cgroup_string, ControllerFlags preferred_controllers,
-      ControllerFlags required_controllers, bool retrieve);
+  bool QueryTaskInfoOfUidAsync(uid_t uid, TaskInfoOfUid *info);
+
+  std::optional<std::string> QueryTaskExecutionNode(task_id_t task_id);
+
+  bool CreateCgroups(std::vector<CgroupSpec> &&cg_specs);
+
+  bool CheckIfCgroupForTasksExists(task_id_t task_id);
+
+  bool AllocateAndGetCgroup(task_id_t task_id, Cgroup **cg);
+
+  bool MigrateProcToCgroupOfTask(pid_t pid, task_id_t task_id);
+
+  bool ReleaseCgroup(uint32_t task_id, uid_t uid);
+
+  bool ReleaseCgroupByTaskIdOnly(task_id_t task_id);
+
+  std::optional<crane::grpc::ResourceInNode> GetTaskResourceInNode(
+      task_id_t task_id);
+
+  static std::vector<EnvPair> GetResourceEnvListByResInNode(
+      const crane::grpc::ResourceInNode &res_in_node);
+
+  std::vector<EnvPair> GetResourceEnvListOfTask(task_id_t task_id);
 
  private:
-  static int initialize_controller(struct cgroup &cgroup,
-                                   CgroupConstant::Controller controller,
-                                   bool required, bool has_cgroup,
-                                   bool &changed_cgroup);
+  static std::string CgroupStrByTaskId_(task_id_t task_id);
 
-  inline static ControllerFlags m_mounted_controllers_;
+  std::unique_ptr<Cgroup> CreateOrOpen_(const std::string &cgroup_string,
+                                        ControllerFlags preferred_controllers,
+                                        ControllerFlags required_controllers,
+                                        bool retrieve);
+
+  int InitializeController_(struct cgroup &cgroup,
+                            CgroupConstant::Controller controller,
+                            bool required, bool has_cgroup,
+                            bool &changed_cgroup);
+
+  void RmAllTaskCgroups_();
+  void RmAllTaskCgroupsUnderController_(CgroupConstant::Controller controller);
+
+  ControllerFlags m_mounted_controllers_;
+
+  util::AtomicHashMap<absl::flat_hash_map, task_id_t, CgroupSpec>
+      m_task_id_to_cg_spec_map_;
+
+  util::AtomicHashMap<absl::flat_hash_map, task_id_t, std::unique_ptr<Cgroup>>
+      m_task_id_to_cg_map_;
+
+  util::AtomicHashMap<absl::flat_hash_map, uid_t /*uid*/,
+                      absl::flat_hash_set<task_id_t>>
+      m_uid_to_task_ids_map_;
 };
 
-}  // namespace util
+}  // namespace Craned
+
+inline std::unique_ptr<Craned::CgroupManager> g_cg_mgr;

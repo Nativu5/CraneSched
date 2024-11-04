@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -52,7 +54,13 @@ class BasicPriority : public IPrioritySorter {
 
     int i = 0;
     for (auto it = pending_task_map.begin(); i < len; i++, it++) {
-      task_id_vec.emplace_back(it->first);
+      TaskInCtld* task = it->second.get();
+      if (!task->Held()) {
+        task_id_vec.emplace_back(it->first);
+        it->second->pending_reason = "Priority";
+      } else {
+        it->second->pending_reason = "Held";
+      }
     }
 
     return task_id_vec;
@@ -79,8 +87,9 @@ class MultiFactorPriority : public IPrioritySorter {
   };
 
   void CalculateFactorBound_(const OrderedTaskMap& pending_task_map,
-                             const UnorderedTaskMap& running_task_map);
-  double CalculatePriority_(Ctld::TaskInCtld* task);
+                             const UnorderedTaskMap& running_task_map,
+                             absl::Time now);
+  double CalculatePriority_(Ctld::TaskInCtld* task, absl::Time now) const;
 
   FactorBound m_factor_bound_;
 };
@@ -142,7 +151,7 @@ class MinLoadFirst : public INodeSelectionAlgo {
    * In time interval [y, z-1], the amount of available resources is b.
    * In time interval [z, ...], the amount of available resources is c.
    */
-  using TimeAvailResMap = std::map<absl::Time, Resources>;
+  using TimeAvailResMap = std::map<absl::Time, ResourceInNode>;
 
   struct TimeSegment {
     TimeSegment(absl::Time start, absl::Duration duration)
@@ -167,8 +176,8 @@ class MinLoadFirst : public INodeSelectionAlgo {
       const absl::flat_hash_map<uint32_t, std::unique_ptr<TaskInCtld>>&
           running_tasks,
       absl::Time now, const PartitionId& partition_id,
-      const util::Synchronized<PartitionMeta>& partition_meta_ptr,
-      const CranedMetaContainerInterface::CranedMetaRawMap& craned_meta_map,
+      const std::unordered_set<CranedId> craned_ids,
+      const CranedMetaContainer::CranedMetaRawMap& craned_meta_map,
       NodeSelectionInfo* node_selection_info);
 
   // Input should guarantee that provided nodes in `node_selection_info` has
@@ -176,13 +185,13 @@ class MinLoadFirst : public INodeSelectionAlgo {
   static bool CalculateRunningNodesAndStartTime_(
       const NodeSelectionInfo& node_selection_info,
       const util::Synchronized<PartitionMeta>& partition_meta_ptr,
-      const CranedMetaContainerInterface::CranedMetaRawMap& craned_meta_map,
+      const CranedMetaContainer::CranedMetaRawMap& craned_meta_map,
       TaskInCtld* task, absl::Time now, std::list<CranedId>* craned_ids,
       absl::Time* start_time);
 
   static void SubtractTaskResourceNodeSelectionInfo_(
       absl::Time const& expected_start_time, absl::Duration const& duration,
-      Resources const& resources, std::list<CranedId> const& craned_ids,
+      ResourceV2 const& resources, std::list<CranedId> const& craned_ids,
       NodeSelectionInfo* node_selection_info);
 
   IPrioritySorter* m_priority_sorter_;
@@ -217,7 +226,11 @@ class TaskScheduler {
   /// Otherwise, it is set to newly allocated task id.
   std::future<task_id_t> SubmitTaskAsync(std::unique_ptr<TaskInCtld> task);
 
-  CraneErr ChangeTaskTimeLimit(uint32_t task_id, int64_t secs);
+  std::future<CraneErr> HoldReleaseTaskAsync(task_id_t task_id, int64_t secs);
+
+  CraneErr ChangeTaskTimeLimit(task_id_t task_id, int64_t secs);
+
+  CraneErr ChangeTaskPriority(task_id_t task_id, double priority);
 
   void TaskStatusChangeWithReasonAsync(uint32_t task_id,
                                        const CranedId& craned_index,
@@ -241,6 +254,24 @@ class TaskScheduler {
   crane::grpc::CancelTaskReply CancelPendingOrRunningTask(
       const crane::grpc::CancelTaskRequest& request);
 
+  CraneErr TerminatePendingOrRunningTask(uint32_t task_id) {
+    LockGuard pending_guard(&m_pending_task_map_mtx_);
+    LockGuard running_guard(&m_running_task_map_mtx_);
+
+    auto pd_it = m_pending_task_map_.find(task_id);
+    if (pd_it != m_pending_task_map_.end()) {
+      m_cancel_task_queue_.enqueue(
+          CancelPendingTaskQueueElem{.task = std::move(pd_it->second)});
+      m_cancel_task_async_handle_->send();
+      return CraneErr::kOk;
+    }
+
+    auto rn_it = m_running_task_map_.find(task_id);
+    if (rn_it == m_running_task_map_.end()) return CraneErr::kNonExistent;
+
+    return TerminateRunningTaskNoLock_(rn_it->second.get());
+  }
+
   CraneErr TerminateRunningTask(uint32_t task_id) {
     LockGuard running_guard(&m_running_task_map_mtx_);
 
@@ -255,33 +286,48 @@ class TaskScheduler {
   static CraneErr CheckTaskValidity(TaskInCtld* task);
 
  private:
+  template <class... Ts>
+  struct VariantVisitor : Ts... {
+    using Ts::operator()...;
+  };
+
+  template <class... Ts>
+  VariantVisitor(Ts...) -> VariantVisitor<Ts...>;
+
   void RequeueRecoveredTaskIntoPendingQueueLock_(
       std::unique_ptr<TaskInCtld> task);
 
   void PutRecoveredTaskIntoRunningQueueLock_(std::unique_ptr<TaskInCtld> task);
+
+  static void ProcessFinalTasks_(std::vector<TaskInCtld*> const& tasks);
+
+  static void CallPluginHookForFinalTasks_(
+      std::vector<TaskInCtld*> const& tasks);
 
   static void PersistAndTransferTasksToMongodb_(
       std::vector<TaskInCtld*> const& tasks);
 
   CraneErr TerminateRunningTaskNoLock_(TaskInCtld* task);
 
+  CraneErr SetHoldForTaskInRamAndDb_(task_id_t task_id, bool hold);
+
   std::unique_ptr<INodeSelectionAlgo> m_node_selection_algo_;
 
   // Ordered by task id. Those who comes earlier are in the head,
   // Because they have smaller task id.
   TreeMap<task_id_t, std::unique_ptr<TaskInCtld>> m_pending_task_map_
-      GUARDED_BY(m_pending_task_map_mtx_);
+      ABSL_GUARDED_BY(m_pending_task_map_mtx_);
   Mutex m_pending_task_map_mtx_;
 
   std::atomic_uint32_t m_pending_map_cached_size_;
 
   HashMap<task_id_t, std::unique_ptr<TaskInCtld>> m_running_task_map_
-      GUARDED_BY(m_running_task_map_mtx_);
+      ABSL_GUARDED_BY(m_running_task_map_mtx_);
   Mutex m_running_task_map_mtx_;
 
   // Task Indexes
   HashMap<CranedId, HashSet<uint32_t /* Task ID*/>> m_node_to_tasks_map_
-      GUARDED_BY(m_task_indexes_mtx_);
+      ABSL_GUARDED_BY(m_task_indexes_mtx_);
   Mutex m_task_indexes_mtx_;
 
   std::unique_ptr<IPrioritySorter> m_priority_sorter_;
@@ -291,6 +337,9 @@ class TaskScheduler {
 
   std::thread m_schedule_thread_;
   void ScheduleThread_();
+
+  std::thread m_task_release_thread_;
+  void ReleaseTaskThread_(const std::shared_ptr<uvw::loop>& uvw_loop);
 
   std::thread m_task_cancel_thread_;
   void CancelTaskThread_(const std::shared_ptr<uvw::loop>& uvw_loop);
@@ -302,11 +351,40 @@ class TaskScheduler {
   void TaskStatusChangeThread_(const std::shared_ptr<uvw::loop>& uvw_loop);
 
   // Working as channels in golang.
+  std::shared_ptr<uvw::timer_handle> m_task_timer_handle_;
+  void CleanTaskTimerCb_();
+
+  std::unordered_map<task_id_t, std::shared_ptr<uvw::timer_handle>>
+      m_task_timer_handles_;
+
+  std::shared_ptr<uvw::async_handle> m_task_timeout_async_handle_;
+
+  using TaskTimerQueueElem =
+      std::pair<std::pair<task_id_t, int64_t>, std::promise<CraneErr>>;
+  ConcurrentQueue<TaskTimerQueueElem> m_task_timer_queue_;
+
+  void TaskTimerAsyncCb_();
+
+  std::shared_ptr<uvw::async_handle> m_clean_task_timer_queue_handle_;
+  void CleanTaskTimerQueueCb_(const std::shared_ptr<uvw::loop>& uvw_loop);
+
   std::shared_ptr<uvw::timer_handle> m_cancel_task_timer_handle_;
   void CancelTaskTimerCb_();
 
+  struct CancelPendingTaskQueueElem {
+    std::unique_ptr<TaskInCtld> task;
+  };
+
+  struct CancelRunningTaskQueueElem {
+    task_id_t task_id;
+    CranedId craned_id;
+  };
+
+  using CancelTaskQueueElem =
+      std::variant<CancelPendingTaskQueueElem, CancelRunningTaskQueueElem>;
+
   std::shared_ptr<uvw::async_handle> m_cancel_task_async_handle_;
-  ConcurrentQueue<std::pair<task_id_t, CranedId>> m_cancel_task_queue_;
+  ConcurrentQueue<CancelTaskQueueElem> m_cancel_task_queue_;
   void CancelTaskAsyncCb_();
 
   std::shared_ptr<uvw::async_handle> m_clean_cancel_queue_handle_;

@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "EmbeddedDbClient.h"
@@ -260,6 +262,12 @@ result::result<void, DbErrorCode> BerkeleyDb::Init(const std::string& path) {
 
   try {
     m_env_ = std::make_unique<DbEnv>(0);
+
+    // Must be called before DB_ENV->open()!
+    // Set max transaction number to 1 to avoid deadlock handling.
+    if (m_env_->set_tx_max(1) != 0)
+      CRANE_ERROR("Error when set_tx_max(1) for BDB {}!", m_db_path_);
+
     m_env_->open(m_env_home_.c_str(), env_flags, 0);
     m_db_ = std::make_unique<Db>(m_env_.get(), 0);  // Instantiate the Db object
 
@@ -579,15 +587,15 @@ bool EmbeddedDbClient::RetrieveLastSnapshot(DbSnapshot* snapshot) {
 
         // Dispatch to different queues by status.
         switch (status) {
-          case crane::grpc::Pending:
-            snapshot->pending_queue.emplace(id, std::move(task));
-            break;
-          case crane::grpc::Running:
-            snapshot->running_queue.emplace(id, std::move(task));
-            break;
-          default:
-            snapshot->final_queue.emplace(id, std::move(task));
-            break;
+        case crane::grpc::Pending:
+          snapshot->pending_queue.emplace(id, std::move(task));
+          break;
+        case crane::grpc::Running:
+          snapshot->running_queue.emplace(id, std::move(task));
+          break;
+        default:
+          snapshot->final_queue.emplace(id, std::move(task));
+          break;
         }
         return true;
       });
@@ -685,8 +693,8 @@ bool EmbeddedDbClient::PurgeEndedTasks(const std::vector<db_id_t>& db_ids) {
     res = m_variable_db_->Delete(txn_id, GetVariableDbEntryName_(id));
     if (res.has_error()) {
       CRANE_ERROR(
-          "Failed to delete embedded variable data entry.Error code: {}",
-          res.error());
+          "Failed to delete embedded variable data entry. Error code: {}",
+          int(res.error()));
       return false;
     }
   }
@@ -697,7 +705,7 @@ bool EmbeddedDbClient::PurgeEndedTasks(const std::vector<db_id_t>& db_ids) {
     res = m_fixed_db_->Delete(txn_id, GetFixedDbEntryName_(id));
     if (res.has_error()) {
       CRANE_ERROR("Failed to delete embedded fixed data entry. Error code: {}",
-                  res.error());
+                  int(res.error()));
       return false;
     }
   }

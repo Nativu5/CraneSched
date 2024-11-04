@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 syntax = "proto3";
@@ -36,10 +38,39 @@ message AllocatableResource {
   uint64 memory_sw_limit_bytes = 3;
 }
 
-message DedicatedResource {}
+message TypeCountMap{
+  map <string/*Type*/, uint64> type_count_map = 1;
+  uint64 total = 2;
+}
 
-message Resources {
-  AllocatableResource allocatable_resource = 1;
+message DeviceMap{
+  map<string /*name*/, TypeCountMap> name_type_map = 1;
+}
+
+message Slots{
+  repeated string slots = 1;
+}
+
+message DeviceTypeSlotsMap{
+  map<string /*Type*/, Slots /*index of slot*/> type_slots_map = 1;
+}
+
+message DedicatedResourceInNode{
+  map <string /*device name*/, DeviceTypeSlotsMap> name_type_map = 1;
+}
+
+message ResourceInNode {
+  AllocatableResource allocatable_res_in_node = 1;
+  DedicatedResourceInNode dedicated_res_in_node = 2;
+}
+
+message ResourceV2 {
+  map <string /*craned id*/, ResourceInNode> each_node_res = 1;
+}
+
+message ResourceView {
+  AllocatableResource allocatable_res = 1;
+  DeviceMap device_map = 2;
 }
 
 enum PartitionState {
@@ -47,11 +78,16 @@ enum PartitionState {
   PARTITION_DOWN = 1;
 }
 
-enum CranedState{
+enum CranedResourceState {
   CRANE_IDLE = 0;
   CRANE_MIX = 1;
   CRANE_ALLOC = 2;
   CRANE_DOWN = 3;
+}
+
+enum CranedControlState {
+  CRANE_NONE = 0;
+  CRANE_DRAIN = 1;
 }
 
 enum TaskStatus {
@@ -70,12 +106,17 @@ enum TaskType {
   Batch = 1;
 }
 
+enum InteractiveTaskType {
+  Calloc = 0;
+  Crun = 1;
+}
+
 message TaskToCtld {
   /* -------- Fields that are set at the submission time. ------- */
   google.protobuf.Duration time_limit = 1;
 
   string partition_name = 2;
-  Resources resources = 3;
+  ResourceView resources = 3;
 
   TaskType type = 4;
 
@@ -94,6 +135,8 @@ message TaskToCtld {
     BatchTaskAdditionalMeta batch_meta = 21;
     InteractiveTaskAdditionalMeta interactive_meta = 22;
   }
+
+  string extra_attr = 23;
 
   string cmd_line = 31;
   string cwd = 32; // Current working directory
@@ -124,6 +167,9 @@ message RuntimeAttrOfTask {
   google.protobuf.Timestamp submit_time = 15;
   google.protobuf.Timestamp start_time = 16;
   google.protobuf.Timestamp end_time = 17;
+
+  bool held = 18;
+  ResourceV2 resources = 19;
 }
 
 message TaskToD {
@@ -131,7 +177,7 @@ message TaskToD {
   TaskType type = 2;
   uint32 partition_id = 3;
 
-  Resources resources = 4;
+  ResourceInNode resources = 4;
 
   // If this task is PENDING, start_time is either not set (default constructed)
   // or an estimated start time.
@@ -173,6 +219,10 @@ message BatchTaskAdditionalMeta {
 }
 
 message InteractiveTaskAdditionalMeta{
+  string cfored_name = 1;
+  string sh_script = 2;
+  string term_env = 3;
+  InteractiveTaskType interactive_type = 4;
 }
 
 message TaskInfo {
@@ -181,27 +231,44 @@ message TaskInfo {
   uint32 task_id = 2;
   string name = 3;
   string partition = 4;
-  uint32 uid = 5;
 
+  uint32 uid = 5;
   uint32 gid = 6;
+
   google.protobuf.Duration time_limit = 7;
   google.protobuf.Timestamp start_time = 8;
   google.protobuf.Timestamp end_time = 9;
   google.protobuf.Timestamp submit_time = 10;
-  string account = 11;
 
+  string account = 11;
   uint32 node_num = 12;
   string cmd_line = 13;
   string cwd = 14;
   string username = 15;
   string qos = 16;
+  ResourceView res_view = 17;
+  repeated string req_nodes = 19;
+  repeated string exclude_nodes = 20;
+
+  string extra_attr = 21;
 
   // Dynamic task information
+  bool held = 30;
   TaskStatus status = 31;
-  string craned_list = 32;
-  double alloc_cpu = 33;
-  uint32 exit_code = 34;
-  uint32 priority = 35;
+
+  uint32 exit_code = 33;
+  uint32 priority = 34;
+  oneof pending_reason_or_craned_list {
+    string pending_reason = 35;
+    string craned_list = 36;
+  }
+
+  // The time of different nodes across the whole cluster might not always be synchronized.
+  // If the time on the front end node is more than several seconds ahead of the CraneCtld node,
+  // a negative elapsed time might occur.
+  // To avoid this, the elapsed time of a task is calculated on the CraneCtld side.
+  google.protobuf.Duration elapsed_time = 37;
+  repeated string execution_node = 38;
 }
 
 message PartitionInfo {
@@ -211,32 +278,37 @@ message PartitionInfo {
 
   uint32 total_nodes = 4;
   uint32 alive_nodes = 5;
-  double total_cpu = 6;
-  double avail_cpu = 7;
-  double alloc_cpu = 8;
-  uint64 total_mem = 9;
-  uint64 avail_mem = 10;
-  uint64 alloc_mem = 11;
+
+  ResourceView res_total = 6;
+  ResourceView res_avail = 7;
+  ResourceView res_alloc = 8;
 }
 
 message CranedInfo {
   string hostname = 1;
-  CranedState state = 2;
-  double cpu = 3;
-  double alloc_cpu = 4;
-  double free_cpu = 5;
-  uint64 real_mem = 6;
-  uint64 alloc_mem = 7;
-  uint64 free_mem = 8;
-  repeated string partition_names = 9;
-  uint32 running_task_num = 10;
+  CranedResourceState resource_state = 2;
+  CranedControlState control_state = 3;
+
+  ResourceInNode res_total = 4;
+  ResourceInNode res_avail = 5;
+  ResourceInNode res_alloc = 6;
+
+  repeated string partition_names = 10;
+  uint32 running_task_num = 11;
+
+  string craned_version = 12;
+  string system_desc = 13;
+  google.protobuf.Timestamp craned_start_time = 14;
+  google.protobuf.Timestamp system_boot_time = 15;
+  google.protobuf.Timestamp last_busy_time = 16;
 }
 
 message TrimmedPartitionInfo {
   message TrimmedCranedInfo {
-    CranedState state = 1;
-    uint32 count = 2;
-    string craned_list_regex = 3;
+    CranedResourceState resource_state = 1;
+    CranedControlState control_state = 2;
+    uint32 count = 3;
+    string craned_list_regex = 4;
   }
 
   string name = 1;
@@ -277,6 +349,7 @@ message UserInfo {
     None = 0;
     Operator = 1;
     Admin = 2;
+    Root = 3;
   };
   message AllowedPartitionQos{
     string partition_name = 1;
@@ -305,4 +378,18 @@ message QosInfo {
 message TimeInterval {
   google.protobuf.Timestamp lower_bound = 1;
   google.protobuf.Timestamp upper_bound = 2;
+}
+
+message SystemRelInfo {
+  string name = 1;
+  string release = 2;
+  string version = 3;
+}
+
+message CranedRemoteMeta {
+  DedicatedResourceInNode dres_in_node = 1;
+  SystemRelInfo sys_rel_info = 2;
+  string craned_version = 3;
+  google.protobuf.Timestamp craned_start_time = 4;
+  google.protobuf.Timestamp system_boot_time = 5;
 }

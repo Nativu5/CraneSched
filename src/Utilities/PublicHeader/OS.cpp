@@ -1,24 +1,33 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "crane/OS.h"
 
-namespace util {
+#if defined(__linux__) || defined(__unix__)
+#  include <sys/sysinfo.h>
+#  include <sys/utsname.h>
+#elif defined(_WIN32)
+#  error "Win32 Platform is not supported now!"
+#else
+#  error "Unsupported OS"
+#endif
 
-namespace os {
+namespace util::os {
 
 bool DeleteFile(std::string const& p) {
   std::error_code ec;
@@ -102,6 +111,39 @@ bool SetMaxFileDescriptorNumber(unsigned long num) {
   return setrlimit(RLIMIT_NOFILE, &rlim) == 0;
 }
 
-}  // namespace os
+bool GetSystemReleaseInfo(SystemRelInfo* info) {
+#if defined(__linux__) || defined(__unix__)
+  utsname utsname_info{};
 
-}  // namespace util
+  if (uname(&utsname_info) != -1) {
+    info->name = utsname_info.sysname;
+    info->release = utsname_info.release;
+    info->version = utsname_info.version;
+    return true;
+  }
+
+  return false;
+
+#else
+#  error "Unsupported OS"
+#endif
+}
+
+absl::Time GetSystemBootTime() {
+#if defined(__linux__) || defined(__unix__)
+  struct sysinfo system_info;
+  if (sysinfo(&system_info) != 0) {
+    CRANE_ERROR("Failed to get sysinfo {}.", strerror(errno));
+    return {};
+  }
+
+  absl::Time current_time = absl::FromTimeT(time(nullptr));
+  absl::Duration uptime = absl::Seconds(system_info.uptime);
+  return current_time - uptime;
+
+#else
+#  error "Unsupported OS"
+#endif
+}
+
+}  // namespace util::os

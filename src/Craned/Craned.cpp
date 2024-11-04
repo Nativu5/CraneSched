@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CranedPublicDefs.h"
@@ -20,18 +22,22 @@
 #include <event2/thread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
 #include <yaml-cpp/yaml.h>
 
+#include <ctime>
 #include <cxxopts.hpp>
 
+#include "CforedClient.h"
 #include "CranedServer.h"
 #include "CtldClient.h"
 #include "crane/Network.h"
 #include "crane/OS.h"
+#include "crane/PluginClient.h"
 #include "crane/PublicHeader.h"
 #include "crane/String.h"
 
-using Craned::CranedNode;
 using Craned::g_config;
 using Craned::Partition;
 
@@ -42,14 +48,16 @@ void ParseConfig(int argc, char** argv) {
   options.add_options()
       ("C,config", "Path to configuration file",
       cxxopts::value<std::string>()->default_value(kDefaultConfigPath))
-      ("l,listen", "Listen address format: <IP>:<port>",
+      ("l,listen", "Listening address, format: <IP>:<port>",
        cxxopts::value<std::string>()->default_value(fmt::format("0.0.0.0:{}", kCranedDefaultPort)))
-      ("s,server-address", "CraneCtld address format: <IP>:<port>",
+      ("s,server-address", "CraneCtld address, format: <IP>:<port>",
        cxxopts::value<std::string>())
-      ("L,log-file", "File path of craned log file",
-       cxxopts::value<std::string>()->default_value(kDefaultCranedLogPath))
-      ("D,debug-level", "<trace|debug|info|warn|error>", cxxopts::value<std::string>()->default_value("info"))
-      ("h,help", "Show help")
+      ("L,log-file", "Path to Craned log file",
+       cxxopts::value<std::string>()->default_value(fmt::format("{}{}",kDefaultCraneBaseDir, kDefaultCranedLogPath)))
+      ("D,debug-level", "Logging level of Craned, format: <trace|debug|info|warn|error>",
+       cxxopts::value<std::string>()->default_value("info"))
+      ("v,version", "Display version information")
+      ("h,help", "Display help for Craned")
       ;
   // clang-format on
 
@@ -63,10 +71,22 @@ void ParseConfig(int argc, char** argv) {
 
   if (parsed_args.count("help") > 0) {
     fmt::print("{}\n", options.help());
-    std::exit(1);
+    std::exit(0);
+  }
+
+  if (parsed_args.count("version") > 0) {
+    fmt::print("Version: {}\n", CRANE_VERSION_STRING);
+    fmt::print("Build Time: {}\n", CRANE_BUILD_TIMESTAMP);
+    std::exit(0);
   }
 
   std::string config_path = parsed_args["config"].as<std::string>();
+  std::unordered_map<
+      std::string,
+      std::vector<std::tuple<std::string /*name*/, std::string /*type*/,
+                             std::vector<std::string> /*path*/,
+                             std::string /*EnvInjector*/>>>
+      each_node_device;
   if (std::filesystem::exists(config_path)) {
     try {
       YAML::Node config = YAML::LoadFile(config_path);
@@ -76,13 +96,18 @@ void ParseConfig(int argc, char** argv) {
       else
         g_config.CraneBaseDir = kDefaultCraneBaseDir;
 
-      if (config["CranedLogFile"])
+      if (parsed_args.count("log-file"))
+        g_config.CranedLogFile = parsed_args["log-file"].as<std::string>();
+      else if (config["CranedLogFile"])
         g_config.CranedLogFile =
             g_config.CraneBaseDir + config["CranedLogFile"].as<std::string>();
       else
         g_config.CranedLogFile = g_config.CraneBaseDir + kDefaultCranedLogPath;
 
-      if (config["CranedDebugLevel"])
+      if (parsed_args.count("debug-level"))
+        g_config.CranedDebugLevel =
+            parsed_args["debug-level"].as<std::string>();
+      else if (config["CranedDebugLevel"])
         g_config.CranedDebugLevel =
             config["CranedDebugLevel"].as<std::string>();
       else
@@ -139,6 +164,12 @@ void ParseConfig(int argc, char** argv) {
       else
         g_config.ListenConf.CranedListenAddr = "0.0.0.0";
 
+      if (config["CranedListenPort"])
+        g_config.ListenConf.CranedListenPort =
+            config["CranedListenPort"].as<std::string>();
+      else
+        g_config.ListenConf.CranedListenPort = kCtldDefaultPort;
+
       g_config.ListenConf.CranedListenPort = kCranedDefaultPort;
 
       g_config.ListenConf.UnixSocketListenAddr =
@@ -149,23 +180,23 @@ void ParseConfig(int argc, char** argv) {
 
       if (config["UseTls"] && config["UseTls"].as<bool>()) {
         g_config.ListenConf.UseTls = true;
+        TlsCertificates& tls_certs = g_config.ListenConf.TlsCerts;
 
         if (config["DomainSuffix"])
-          g_config.ListenConf.DomainSuffix =
-              config["DomainSuffix"].as<std::string>();
+          tls_certs.DomainSuffix = config["DomainSuffix"].as<std::string>();
 
         if (config["ServerCertFilePath"]) {
-          g_config.ListenConf.ServerCertFilePath =
+          tls_certs.ServerCertFilePath =
               config["ServerCertFilePath"].as<std::string>();
 
           try {
-            g_config.ListenConf.ServerCertContent = util::ReadFileIntoString(
-                g_config.ListenConf.ServerCertFilePath);
+            tls_certs.ServerCertContent =
+                util::ReadFileIntoString(tls_certs.ServerCertFilePath);
           } catch (const std::exception& e) {
             CRANE_ERROR("Read cert file error: {}", e.what());
             std::exit(1);
           }
-          if (g_config.ListenConf.ServerCertContent.empty()) {
+          if (tls_certs.ServerCertContent.empty()) {
             CRANE_ERROR(
                 "UseTls is true, but the file specified by ServerCertFilePath "
                 "is empty");
@@ -176,17 +207,17 @@ void ParseConfig(int argc, char** argv) {
         }
 
         if (config["ServerKeyFilePath"]) {
-          g_config.ListenConf.ServerKeyFilePath =
+          tls_certs.ServerKeyFilePath =
               config["ServerKeyFilePath"].as<std::string>();
 
           try {
-            g_config.ListenConf.ServerKeyContent =
-                util::ReadFileIntoString(g_config.ListenConf.ServerKeyFilePath);
+            tls_certs.ServerKeyContent =
+                util::ReadFileIntoString(tls_certs.ServerKeyFilePath);
           } catch (const std::exception& e) {
             CRANE_ERROR("Read cert file error: {}", e.what());
             std::exit(1);
           }
-          if (g_config.ListenConf.ServerKeyContent.empty()) {
+          if (tls_certs.ServerKeyContent.empty()) {
             CRANE_ERROR(
                 "UseTls is true, but the file specified by ServerKeyFilePath "
                 "is empty");
@@ -213,7 +244,7 @@ void ParseConfig(int argc, char** argv) {
         for (auto it = config["Nodes"].begin(); it != config["Nodes"].end();
              ++it) {
           auto node = it->as<YAML::Node>();
-          auto node_ptr = std::make_shared<CranedNode>();
+          auto node_res = std::make_shared<ResourceInNode>();
           std::list<std::string> name_list;
 
           if (node["name"]) {
@@ -227,7 +258,8 @@ void ParseConfig(int argc, char** argv) {
             std::exit(1);
 
           if (node["cpu"])
-            node_ptr->cpu = std::stoul(node["cpu"].as<std::string>());
+            node_res->allocatable_res.cpu_count =
+                cpu_t(std::stoul(node["cpu"].as<std::string>()));
           else
             std::exit(1);
 
@@ -248,30 +280,131 @@ void ParseConfig(int argc, char** argv) {
             else if (mem_group[2] == "G")
               memory_bytes *= 1024 * 1024 * 1024;
 
-            node_ptr->memory_bytes = memory_bytes;
+            node_res->allocatable_res.memory_bytes = memory_bytes;
+            node_res->allocatable_res.memory_sw_bytes = memory_bytes;
           } else
             std::exit(1);
 
+          std::vector<std::tuple<std::string /*name*/, std::string /*type*/,
+                                 std::vector<std::string> /*path*/,
+                                 std::string /*EnvInjector*/>>
+              devices;
+          if (node["gres"]) {
+            for (auto gres_it = node["gres"].begin();
+                 gres_it != node["gres"].end(); ++gres_it) {
+              const auto& gres_node = gres_it->as<YAML::Node>();
+              const auto& device_name = gres_node["name"].as<std::string>();
+              const auto& device_type = gres_node["type"].as<std::string>();
+              bool device_file_configured = false;
+              std::string env_injector;
+              if (gres_node["EnvInjector"]) {
+                env_injector = gres_node["EnvInjector"].as<std::string>();
+              }
+              if (gres_node["DeviceFileRegex"]) {
+                device_file_configured = true;
+                std::list<std::string> device_path_list;
+                if (!util::ParseHostList(gres_node["DeviceFileRegex"].Scalar(),
+                                         &device_path_list)) {
+                  CRANE_ERROR(
+                      "Illegal gres {}:{} DeviceFileRegex path string format.",
+                      device_name, device_type);
+                  std::exit(1);
+                }
+                for (const auto& device_path : device_path_list) {
+                  devices.push_back(std::make_tuple(device_name, device_type,
+                                                    std::vector{device_path},
+                                                    env_injector));
+                }
+              }
+              if (gres_node["DeviceFileList"] &&
+                  gres_node["DeviceFileList"].IsSequence()) {
+                device_file_configured = true;
+                for (const auto& file_regex :
+                     gres_node["DeviceFileList"]
+                         .as<std::vector<std::string>>()) {
+                  std::list<std::string> device_path_list;
+                  if (!util::ParseHostList(file_regex, &device_path_list)) {
+                    CRANE_ERROR(
+                        "Illegal gres {}:{} DeviceFileList path string format.",
+                        device_name, device_type);
+                    std::exit(1);
+                  }
+                  devices.push_back(
+                      std::make_tuple(device_name, device_type,
+                                      std::vector(device_path_list.begin(),
+                                                  device_path_list.end()),
+                                      env_injector));
+                }
+              }
+              if (!device_file_configured) {
+                CRANE_ERROR(
+                    "gres {}:{} device DeviceFileRegex or DeviceFileList not "
+                    "configured",
+                    device_name, device_type);
+              }
+            }
+          }
+
           for (auto&& name : name_list) {
-            if (crane::IsAValidIpv4Address(name)) {
-              CRANE_INFO(
-                  "Node name `{}` is a valid ipv4 address and doesn't "
-                  "need resolving.",
-                  name);
-              g_config.Ipv4ToCranedHostname[name] = name;
-              g_config.CranedNodes[name] = node_ptr;
-            } else {
-              std::string ipv4;
-              if (!crane::ResolveIpv4FromHostname(name, &ipv4)) {
+            for (auto& dev : devices) {
+              each_node_device[name].push_back(dev);
+            }
+
+            ipv4_t ipv4;
+            ipv6_t ipv6;
+            switch (crane::GetIpAddrVer(name)) {
+            case -1: {
+              bool ip_resolved = false;
+              if (crane::ResolveIpv4FromHostname(name, &ipv4)) {
+                g_config.Ipv4ToCranedHostname[ipv4] = name;
+                CRANE_INFO("Resolve hostname `{}` to `{}`", name,
+                           crane::Ipv4ToStr(ipv4));
+                ip_resolved = true;
+              }
+
+              if (crane::ResolveIpv6FromHostname(name, &ipv6)) {
+                g_config.Ipv6ToCranedHostname[ipv6] = name;
+                CRANE_INFO("Resolve hostname `{}` to `{}`", name,
+                           crane::Ipv6ToStr(ipv6));
+                ip_resolved = true;
+              }
+
+              if (!ip_resolved) {
                 CRANE_ERROR("Init error: Cannot resolve hostname of `{}`",
                             name);
                 std::exit(1);
               }
-              CRANE_INFO("Resolve hostname `{}` to `{}`", name, ipv4);
-              g_config.Ipv4ToCranedHostname[ipv4] = name;
-
-              g_config.CranedNodes[name] = node_ptr;
+              break;
             }
+
+            case 4: {
+              CRANE_INFO(
+                  "Node name `{}` is a valid ipv4 address and doesn't "
+                  "need resolving.",
+                  name);
+              if (!crane::StrToIpv4(name, &ipv4)) {
+                std::exit(1);
+              }
+              g_config.Ipv4ToCranedHostname[ipv4] = name;
+              break;
+            }
+
+            case 6: {
+              CRANE_INFO(
+                  "Node name `{}` is a valid ipv6 address and doesn't "
+                  "need resolving.",
+                  name);
+              if (!crane::StrToIpv6(name, &ipv6)) {
+                std::exit(1);
+              }
+              g_config.Ipv6ToCranedHostname[ipv6] = name;
+              break;
+            }
+
+            default:
+              ABSL_UNREACHABLE();
+            }
+            g_config.CranedRes[name] = node_res;
           }
         }
       }
@@ -303,8 +436,8 @@ void ParseConfig(int argc, char** argv) {
           for (auto&& node : name_list) {
             std::string node_s{node};
 
-            auto node_it = g_config.CranedNodes.find(node_s);
-            if (node_it != g_config.CranedNodes.end()) {
+            auto node_it = g_config.CranedRes.find(node_s);
+            if (node_it != g_config.CranedRes.end()) {
               part.nodes.emplace(node_it->first);
               CRANE_INFO("Find node {} in partition {}", node_it->first, name);
             } else {
@@ -325,6 +458,23 @@ void ParseConfig(int argc, char** argv) {
           else
             g_config.CranedForeground = false;
         }
+
+        if (config["Plugin"]) {
+          const auto& plugin_config = config["Plugin"];
+
+          if (plugin_config["Enabled"])
+            g_config.Plugin.Enabled = plugin_config["Enabled"].as<bool>();
+
+          if (plugin_config["PlugindSockPath"]) {
+            g_config.Plugin.PlugindSockPath =
+                fmt::format("unix://{}{}", g_config.CraneBaseDir,
+                            plugin_config["PlugindSockPath"].as<std::string>());
+          } else {
+            g_config.Plugin.PlugindSockPath =
+                fmt::format("unix://{}{}", g_config.CraneBaseDir,
+                            kDefaultPlugindUnixSockPath);
+          }
+        }
       }
     } catch (YAML::BadFile& e) {
       CRANE_CRITICAL("Can't open config file {}: {}", kDefaultConfigPath,
@@ -334,10 +484,6 @@ void ParseConfig(int argc, char** argv) {
   } else {
     CRANE_CRITICAL("Config file '{}' not existed", config_path);
     std::exit(1);
-  }
-  // Todo: Check static level setting.
-  if (parsed_args.count("debug-level")) {
-    g_config.CranedDebugLevel = parsed_args["debug-level"].as<std::string>();
   }
 
   if (parsed_args.count("listen")) {
@@ -358,20 +504,15 @@ void ParseConfig(int argc, char** argv) {
     g_config.ControlMachine = parsed_args["server-address"].as<std::string>();
   }
 
-  if (parsed_args.count("debug-level")) {
-    g_config.CranedDebugLevel = parsed_args["debug-level"].as<std::string>();
+  if (crane::GetIpAddrVer(g_config.ListenConf.CranedListenAddr) == -1) {
+    CRANE_ERROR("Listening address is invalid.");
+    std::exit(1);
   }
 
-  if (parsed_args.count("log-file")) {
-    g_config.CranedLogFile = parsed_args["log-file"].as<std::string>();
-  }
-
-  // Check the format of CranedListen
-  std::regex ipv4_re(R"(^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$)");
-  std::smatch ivp4_match;
-  if (!std::regex_match(g_config.ListenConf.CranedListenAddr, ivp4_match,
-                        ipv4_re)) {
-    CRANE_ERROR("Illegal Ctld address format.");
+  std::regex regex_port(R"(^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|)"
+                        R"(65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$)");
+  if (!std::regex_match(g_config.ListenConf.CranedListenPort, regex_port)) {
+    CRANE_ERROR("Listening port is invalid.");
     std::exit(1);
   }
 
@@ -383,13 +524,36 @@ void ParseConfig(int argc, char** argv) {
   }
   g_config.Hostname.assign(hostname);
 
-  if (!g_config.CranedNodes.contains(g_config.Hostname)) {
+  if (!g_config.CranedRes.contains(g_config.Hostname)) {
     CRANE_ERROR("This machine {} is not contained in Nodes!",
                 g_config.Hostname);
     std::exit(1);
   }
 
   CRANE_INFO("Found this machine {} in Nodes", g_config.Hostname);
+  // get this node device info
+  // Todo: Auto detect device
+  {
+    auto node_res = g_config.CranedRes.at(g_config.Hostname);
+    auto& devices = each_node_device[g_config.Hostname];
+    for (auto& dev_arg : devices) {
+      std::string name, type, env_injector;
+      std::vector<std::string> path;
+      std::tie(name, type, path, env_injector) = dev_arg;
+      std::unique_ptr dev = Craned::DeviceManager::ConstructDevice(
+          name, type, path, env_injector);
+      if (!dev->Init()) {
+        CRANE_ERROR("Access Device {} failed.", static_cast<std::string>(*dev));
+        std::exit(1);
+      } else {
+        dev->dev_id = dev->device_metas.front().path;
+        node_res->dedicated_res.name_type_slots_map[dev->name][dev->type]
+            .emplace(dev->dev_id);
+        Craned::g_this_node_device[dev->dev_id] = std::move(dev);
+      }
+    }
+    each_node_device.clear();
+  }
 
   uint32_t part_id, node_index;
   std::string part_name;
@@ -409,6 +573,14 @@ void ParseConfig(int argc, char** argv) {
 
   g_config.CranedIdOfThisNode = g_config.Hostname;
   CRANE_INFO("CranedId of this machine: {}", g_config.CranedIdOfThisNode);
+
+  auto& meta = g_config.CranedMeta;
+  if (bool ok = util::os::GetSystemReleaseInfo(&meta.SysInfo); !ok) {
+    CRANE_ERROR("Error when get system release info");
+  }
+
+  g_config.CranedMeta.CranedStartTime = absl::Now();
+  g_config.CranedMeta.SystemBootTime = util::os::GetSystemBootTime();
 }
 
 void CreateRequiredDirectories() {
@@ -432,12 +604,14 @@ void GlobalVariableInit() {
 
   PasswordEntry::InitializeEntrySize();
 
-  util::CgroupUtil::Init();
-  if (!util::CgroupUtil::Mounted(
-          util::CgroupConstant::Controller::CPU_CONTROLLER) ||
-      !util::CgroupUtil::Mounted(
-          util::CgroupConstant::Controller::MEMORY_CONTROLLER)) {
-    CRANE_ERROR("Failed to initialize cpu and memory cgroups controller.");
+  using Craned::CgroupManager;
+  using Craned::CgroupConstant::Controller;
+  g_cg_mgr = std::make_unique<Craned::CgroupManager>();
+  g_cg_mgr->Init();
+  if (!g_cg_mgr->Mounted(Controller::CPU_CONTROLLER) ||
+      !g_cg_mgr->Mounted(Controller::MEMORY_CONTROLLER) ||
+      !g_cg_mgr->Mounted(Controller::DEVICES_CONTROLLER)) {
+    CRANE_ERROR("Failed to initialize cpu,memory,devices cgroups controller.");
     std::exit(1);
   }
 
@@ -450,6 +624,15 @@ void GlobalVariableInit() {
   g_ctld_client->SetCranedId(g_config.CranedIdOfThisNode);
 
   g_ctld_client->InitChannelAndStub(g_config.ControlMachine);
+
+  if (g_config.Plugin.Enabled) {
+    CRANE_INFO("[Plugin] Plugin module is enabled.");
+    g_plugin_client = std::make_unique<plugin::PluginClient>();
+    g_plugin_client->InitChannelAndStub(g_config.Plugin.PlugindSockPath);
+  }
+
+  g_cfored_manager = std::make_unique<Craned::CforedManager>();
+  g_cfored_manager->Init();
 }
 
 void StartServer() {
@@ -463,7 +646,6 @@ void StartServer() {
 
   // Set FD_CLOEXEC on stdin, stdout, stderr
   util::os::SetCloseOnExecOnFdRange(STDIN_FILENO, STDERR_FILENO + 1);
-
   g_server = std::make_unique<Craned::CranedServer>(g_config.ListenConf);
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -471,9 +653,13 @@ void StartServer() {
   g_server->Wait();
 
   // Free global variables
+  g_task_mgr->Wait();
   g_task_mgr.reset();
+  // CforedManager MUST be destructed after TaskManager.
+  g_cfored_manager.reset();
   g_server.reset();
   g_ctld_client.reset();
+  g_plugin_client.reset();
 
   g_thread_pool->wait();
   g_thread_pool.reset();

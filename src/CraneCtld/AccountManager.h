@@ -1,19 +1,20 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 #pragma once
 
 #include "CtldPublicDefs.h"
@@ -105,12 +106,36 @@ class AccountManager {
 
   result::result<void, std::string> CheckUidIsAdmin(uint32_t uid);
 
+  /**
+   * @param[in] uid is system uid of user.
+   * @param[in] account is the target that uid wants to query or modify.
+   * If its value is an empty string, the permission check fails of course,
+   * but level_of_uid will be filled and thus the function serves as a
+   * query function for user level.
+   * @param[in] read_only_priv specifies the permission type.
+   * If true, the function checks if uid has read/query only permission
+   * to specified account and the check will pass
+   * if the list of accounts the uid belongs to,
+   * which includes all the accounts this uid coordinates
+   * (guaranteed by account rule),
+   * contains any account which is is the parent of target account
+   * (including itself).
+   * If false, the function checks if uid has read/query only permission
+   * to specified account and the check will pass
+   * if the list of accounts coordinated by uid,
+   * contains any account which is is the parent of target account
+   * (including itself).
+   * @param[out] level_of_uid will be written with the user level of uid
+   * when function returns if both uid and user information exist.
+   * @return True if both uid and corresponding user exists and the permission
+   * check is passed, otherwise False.
+   */
   AccountManager::Result HasPermissionToAccount(
-      uint32_t uid, const std::string& account,
+      uint32_t uid, const std::string& account, bool read_only_priv,
       User::AdminLevel* level_of_uid = nullptr);
 
   AccountManager::Result HasPermissionToUser(
-      uint32_t uid, const std::string& user,
+      uint32_t uid, const std::string& target_user, bool read_only_priv,
       User::AdminLevel* level_of_uid = nullptr);
 
  private:

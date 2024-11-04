@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CtldGrpcServer.h"
@@ -152,30 +154,85 @@ grpc::Status CraneCtldServiceImpl::QueryPartitionInfo(
 grpc::Status CraneCtldServiceImpl::ModifyTask(
     grpc::ServerContext *context, const crane::grpc::ModifyTaskRequest *request,
     crane::grpc::ModifyTaskReply *response) {
-  using TargetAttributes = crane::grpc::ModifyTaskRequest::TargetAttributes;
+  using ModifyTaskRequest = crane::grpc::ModifyTaskRequest;
+
+  auto res = g_account_manager->CheckUidIsAdmin(request->uid());
+  if (res.has_error()) {
+    for (auto task_id : request->task_ids()) {
+      response->add_not_modified_tasks(task_id);
+      response->add_not_modified_reasons(res.error());
+    }
+    return grpc::Status::OK;
+  }
 
   CraneErr err;
-  if (request->attribute() ==
-      TargetAttributes::ModifyTaskRequest_TargetAttributes_TimeLimit) {
-    err = g_task_scheduler->ChangeTaskTimeLimit(request->task_id(),
-                                                request->time_limit_seconds());
-    if (err == CraneErr::kOk) {
-      response->set_ok(true);
-    } else if (err == CraneErr::kNonExistent) {
-      response->set_ok(false);
-      response->set_reason(
-          fmt::format("Task #{} was not found in running or pending queue",
-                      request->task_id()));
-    } else if (err == CraneErr::kGenericFailure) {
-      response->set_ok(false);
-      response->set_reason(fmt::format(
-          "The compute node failed to change the time limit of task#{}.",
-          request->task_id()));
+  if (request->attribute() == ModifyTaskRequest::TimeLimit) {
+    for (auto task_id : request->task_ids()) {
+      err = g_task_scheduler->ChangeTaskTimeLimit(
+          task_id, request->time_limit_seconds());
+      if (err == CraneErr::kOk) {
+        response->add_modified_tasks(task_id);
+      } else if (err == CraneErr::kNonExistent) {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons(fmt::format(
+            "Task #{} was not found in running or pending queue.", task_id));
+      } else if (err == CraneErr::kInvalidParam) {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons("Invalid time limit value.");
+      } else {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons(
+            fmt::format("Failed to change the time limit of Task#{}: {}.",
+                        task_id, CraneErrStr(err)));
+      }
+    }
+  } else if (request->attribute() == ModifyTaskRequest::Priority) {
+    for (auto task_id : request->task_ids()) {
+      err = g_task_scheduler->ChangeTaskPriority(task_id,
+                                                 request->mandated_priority());
+      if (err == CraneErr::kOk) {
+        response->add_modified_tasks(task_id);
+      } else if (err == CraneErr::kNonExistent) {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons(
+            fmt::format("Task #{} was not found in pending queue.", task_id));
+      } else {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons(
+            fmt::format("Failed to change priority: {}.", CraneErrStr(err)));
+      }
+    }
+  } else if (request->attribute() == ModifyTaskRequest::Hold) {
+    int64_t secs = request->hold_seconds();
+    for (auto task_id : request->task_ids()) {
+      err = g_task_scheduler->HoldReleaseTaskAsync(task_id, secs).get();
+      if (err == CraneErr::kOk) {
+        response->add_modified_tasks(task_id);
+      } else if (err == CraneErr::kNonExistent) {
+        response->add_not_modified_tasks(task_id);
+        response->add_not_modified_reasons(
+            fmt::format("Task #{} was not found in pending queue.", task_id));
+      } else {
+        response->add_not_modified_tasks(false);
+        response->add_not_modified_reasons(
+            fmt::format("Failed to hold/release job: {}.", CraneErrStr(err)));
+      }
     }
   } else {
-    response->set_ok(false);
-    response->set_reason(fmt::format("Invalid request parameters."));
+    for (auto task_id : request->task_ids()) {
+      response->add_not_modified_tasks(task_id);
+      response->add_not_modified_reasons("Invalid function.");
+    }
   }
+
+  return grpc::Status::OK;
+}
+
+grpc::Status CraneCtldServiceImpl::ModifyNode(
+    grpc::ServerContext *context,
+    const crane::grpc::ModifyCranedStateRequest *request,
+    crane::grpc::ModifyCranedStateReply *response) {
+  *response = g_meta_container->ChangeNodeState(*request);
 
   return grpc::Status::OK;
 }
@@ -187,15 +244,19 @@ grpc::Status CraneCtldServiceImpl::QueryTasksInfo(
   // Query tasks in RAM
   g_task_scheduler->QueryTasksInRam(request, response);
 
-  int num_limit = request->num_limit() <= 0 ? kDefaultQueryTaskNumLimit
-                                            : request->num_limit();
+  size_t num_limit = request->num_limit() == 0 ? kDefaultQueryTaskNumLimit
+                                               : request->num_limit();
+  if (!request->filter_task_ids().empty())
+    num_limit = std::min((size_t)request->filter_task_ids_size(), num_limit);
+
   auto *task_list = response->mutable_task_info_list();
 
   auto sort_and_truncate = [](auto *task_list, size_t limit) -> void {
     std::sort(
         task_list->begin(), task_list->end(),
         [](const crane::grpc::TaskInfo &a, const crane::grpc::TaskInfo &b) {
-          return a.end_time() > b.end_time();
+          return (a.status() == b.status()) ? (a.priority() > b.priority())
+                                            : (a.status() < b.status());
         });
 
     if (task_list->size() > limit)
@@ -211,140 +272,11 @@ grpc::Status CraneCtldServiceImpl::QueryTasksInfo(
 
   // Query completed tasks in Mongodb
   // (only for cacct, which sets `option_include_completed_tasks` to true)
-  std::vector<std::unique_ptr<TaskInDb>> db_ended_list;
-  if (!g_db_client->FetchJobRecords(&db_ended_list,
-                                    num_limit - task_list->size(), true)) {
+  if (!g_db_client->FetchJobRecords(request, response,
+                                    num_limit - task_list->size())) {
     CRANE_ERROR("Failed to call g_db_client->FetchJobRecords");
     return grpc::Status::OK;
   }
-
-  auto db_ended_append_fn = [&](std::unique_ptr<TaskInDb> const &task) {
-    auto *task_it = task_list->Add();
-
-    task_it->set_type(task->type);
-    task_it->set_task_id(task->task_id);
-    task_it->set_name(task->name);
-    task_it->set_partition(task->partition_id);
-    task_it->set_uid(task->uid);
-
-    task_it->set_gid(task->gid);
-    task_it->mutable_time_limit()->set_seconds(
-        ToInt64Seconds(task->time_limit));
-    task_it->mutable_submit_time()->CopyFrom(task->submit_time);
-    task_it->mutable_start_time()->CopyFrom(task->start_time);
-    task_it->mutable_end_time()->CopyFrom(task->end_time);
-    task_it->set_account(task->account);
-
-    task_it->set_node_num(task->node_num);
-    task_it->set_cmd_line(task->cmd_line);
-    task_it->set_cwd(task->cwd);
-    task_it->set_username(task->username);
-    task_it->set_qos(task->qos);
-
-    task_it->set_alloc_cpu(
-        static_cast<double>(task->resources.allocatable_resource.cpu_count) *
-        task->node_num);
-    task_it->set_exit_code(task->exit_code);
-
-    task_it->set_status(task->status);
-    task_it->set_craned_list(task->allocated_craneds_regex);
-  };
-
-  auto db_task_rng_filter_time = [&](std::unique_ptr<TaskInDb> const &task) {
-    bool has_submit_time_interval = request->has_filter_submit_time_interval();
-    bool has_start_time_interval = request->has_filter_start_time_interval();
-    bool has_end_time_interval = request->has_filter_end_time_interval();
-
-    bool valid = true;
-    if (has_submit_time_interval) {
-      const auto &interval = request->filter_submit_time_interval();
-      valid &= !interval.has_lower_bound() ||
-               task->submit_time >= interval.lower_bound();
-      valid &= !interval.has_upper_bound() ||
-               task->submit_time <= interval.upper_bound();
-    }
-
-    if (has_start_time_interval) {
-      const auto &interval = request->filter_start_time_interval();
-      valid &= !interval.has_lower_bound() ||
-               task->start_time >= interval.lower_bound();
-      valid &= !interval.has_upper_bound() ||
-               task->start_time <= interval.upper_bound();
-    }
-
-    if (has_end_time_interval) {
-      const auto &interval = request->filter_end_time_interval();
-      valid &= !interval.has_lower_bound() ||
-               task->end_time >= interval.lower_bound();
-      valid &= !interval.has_upper_bound() ||
-               task->end_time <= interval.upper_bound();
-    }
-
-    return valid;
-  };
-
-  bool no_accounts_constraint = request->filter_accounts().empty();
-  std::unordered_set<std::string> req_accounts(
-      request->filter_accounts().begin(), request->filter_accounts().end());
-  auto db_task_rng_filter_account = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_accounts_constraint || req_accounts.contains(task->account);
-  };
-
-  bool no_username_constraint = request->filter_users().empty();
-  std::unordered_set<std::string> req_users(request->filter_users().begin(),
-                                            request->filter_users().end());
-  auto db_task_rng_filter_user = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_username_constraint || req_users.contains(task->username);
-  };
-
-  bool no_task_names_constraint = request->filter_task_names().empty();
-  std::unordered_set<std::string> req_task_names(
-      request->filter_task_names().begin(), request->filter_task_names().end());
-  auto db_task_rng_filter_name = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_task_names_constraint || req_task_names.contains(task->name);
-  };
-
-  bool no_qos_constraint = request->filter_qos().empty();
-  std::unordered_set<std::string> req_qos(request->filter_qos().begin(),
-                                          request->filter_qos().end());
-  auto db_task_rng_filter_qos = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_qos_constraint || req_qos.contains(task->qos);
-  };
-
-  bool no_partitions_constraint = request->filter_partitions().empty();
-  std::unordered_set<std::string> req_partitions(
-      request->filter_partitions().begin(), request->filter_partitions().end());
-  auto db_task_rng_filter_partition =
-      [&](std::unique_ptr<TaskInDb> const &task) {
-        return no_partitions_constraint ||
-               req_partitions.contains(task->partition_id);
-      };
-
-  bool no_task_ids_constraint = request->filter_task_ids().empty();
-  std::unordered_set<uint32_t> req_task_ids(request->filter_task_ids().begin(),
-                                            request->filter_task_ids().end());
-  auto db_task_rng_filter_id = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_task_ids_constraint || req_task_ids.contains(task->task_id);
-  };
-
-  bool no_task_states_constraint = request->filter_task_states().empty();
-  std::unordered_set<int> req_task_states(request->filter_task_states().begin(),
-                                          request->filter_task_states().end());
-  auto db_task_rng_filter_state = [&](std::unique_ptr<TaskInDb> const &task) {
-    return no_task_states_constraint || req_task_states.contains(task->status);
-  };
-
-  auto db_ended_rng = db_ended_list |
-                      ranges::views::filter(db_task_rng_filter_account) |
-                      ranges::views::filter(db_task_rng_filter_name) |
-                      ranges::views::filter(db_task_rng_filter_partition) |
-                      ranges::views::filter(db_task_rng_filter_id) |
-                      ranges::views::filter(db_task_rng_filter_state) |
-                      ranges::views::filter(db_task_rng_filter_user) |
-                      ranges::views::filter(db_task_rng_filter_time) |
-                      ranges::views::filter(db_task_rng_filter_qos) |
-                      ranges::views::take(num_limit - task_list->size());
-  ranges::for_each(db_ended_rng, db_ended_append_fn);
 
   sort_and_truncate(task_list, num_limit);
   response->set_ok(true);
@@ -355,7 +287,7 @@ grpc::Status CraneCtldServiceImpl::AddAccount(
     grpc::ServerContext *context, const crane::grpc::AddAccountRequest *request,
     crane::grpc::AddAccountReply *response) {
   AccountManager::Result judge_res = g_account_manager->HasPermissionToAccount(
-      request->uid(), request->account().parent_account());
+      request->uid(), request->account().parent_account(), false);
 
   if (!judge_res.ok) {
     response->set_ok(false);
@@ -394,7 +326,7 @@ grpc::Status CraneCtldServiceImpl::AddUser(
     crane::grpc::AddUserReply *response) {
   User::AdminLevel user_level;
   AccountManager::Result judge_res = g_account_manager->HasPermissionToAccount(
-      request->uid(), request->user().account(), &user_level);
+      request->uid(), request->user().account(), false, &user_level);
 
   if (!judge_res.ok) {
     response->set_ok(false);
@@ -464,11 +396,20 @@ grpc::Status CraneCtldServiceImpl::AddQos(
 
   qos.name = qos_info->name();
   qos.description = qos_info->description();
-  qos.priority = qos_info->priority();
+  qos.priority =
+      qos_info->priority() == 0 ? kDefaultQosPriority : qos_info->priority();
   qos.max_jobs_per_user = qos_info->max_jobs_per_user();
   qos.max_cpus_per_user = qos_info->max_cpus_per_user();
-  qos.max_time_limit_per_task =
-      absl::Seconds(qos_info->max_time_limit_per_task());
+
+  int64_t sec = qos_info->max_time_limit_per_task();
+  if (!CheckIfTimeLimitSecIsValid(sec)) {
+    response->set_ok(false);
+    response->set_reason(fmt::format("Time limit should be in [{}, {}] seconds",
+                                     kTaskMinTimeLimitSec,
+                                     kTaskMaxTimeLimitSec));
+    return grpc::Status::OK;
+  }
+  qos.max_time_limit_per_task = absl::Seconds(sec);
 
   AccountManager::Result result = g_account_manager->AddQos(qos);
   if (result.ok) {
@@ -489,84 +430,84 @@ grpc::Status CraneCtldServiceImpl::ModifyEntity(
   AccountManager::Result modify_res;
 
   switch (request->entity_type()) {
-    case crane::grpc::Account:
-      judge_res = g_account_manager->HasPermissionToAccount(request->uid(),
-                                                            request->name());
+  case crane::grpc::Account:
+    judge_res = g_account_manager->HasPermissionToAccount(
+        request->uid(), request->name(), false);
 
-      if (!judge_res.ok) {
-        response->set_ok(false);
-        response->set_reason(judge_res.reason);
-        return grpc::Status::OK;
-      }
-      modify_res = g_account_manager->ModifyAccount(
-          request->type(), request->name(), request->item(), request->value(),
-          request->force());
-      break;
-    case crane::grpc::User: {
-      AccountManager::UserMutexSharedPtr modifier_shared_ptr =
-          g_account_manager->GetExistedUserInfo(request->name());
-      User::AdminLevel user_level;
-      judge_res = g_account_manager->HasPermissionToUser(
-          request->uid(), request->name(), &user_level);
+    if (!judge_res.ok) {
+      response->set_ok(false);
+      response->set_reason(judge_res.reason);
+      return grpc::Status::OK;
+    }
+    modify_res = g_account_manager->ModifyAccount(
+        request->type(), request->name(), request->item(), request->value(),
+        request->force());
+    break;
+  case crane::grpc::User: {
+    AccountManager::UserMutexSharedPtr modifier_shared_ptr =
+        g_account_manager->GetExistedUserInfo(request->name());
+    User::AdminLevel user_level;
+    judge_res = g_account_manager->HasPermissionToUser(
+        request->uid(), request->name(), false, &user_level);
 
-      if (!judge_res.ok) {
-        response->set_ok(false);
-        response->set_reason(judge_res.reason);
-        return grpc::Status::OK;
-      }
-
-      if (modifier_shared_ptr->admin_level >= user_level) {
-        response->set_ok(false);
-        response->set_reason(
-            "Permission error : You cannot modify a user with the same or "
-            "greater permissions as yourself");
-        return grpc::Status::OK;
-      }
-      if (request->item() == "admin_level") {
-        User::AdminLevel new_level;
-        if (request->value() == "none") {
-          new_level = User::None;
-        } else if (request->value() == "operator") {
-          new_level = User::Operator;
-        } else if (request->value() == "admin") {
-          new_level = User::Admin;
-        } else {
-          response->set_ok(false);
-          response->set_reason(
-              fmt::format("Unknown admin level '{}'", request->value()));
-          return grpc::Status::OK;
-        }
-        if (new_level > user_level) {
-          response->set_ok(false);
-          response->set_reason(
-              "Permission error : You cannot modify a user's permissions to "
-              "which greater than your own permissions");
-          return grpc::Status::OK;
-        }
-      }
+    if (!judge_res.ok) {
+      response->set_ok(false);
+      response->set_reason(judge_res.reason);
+      return grpc::Status::OK;
     }
 
-      modify_res = g_account_manager->ModifyUser(
-          request->type(), request->name(), request->partition(),
-          request->account(), request->item(), request->value(),
-          request->force());
-      break;
-
-    case crane::grpc::Qos: {
-      auto res = g_account_manager->CheckUidIsAdmin(request->uid());
-
-      if (res.has_error()) {
+    if (modifier_shared_ptr->admin_level >= user_level) {
+      response->set_ok(false);
+      response->set_reason(
+          "Permission error : You cannot modify a user with the same or "
+          "greater permissions as yourself");
+      return grpc::Status::OK;
+    }
+    if (request->item() == "admin_level") {
+      User::AdminLevel new_level;
+      if (request->value() == "none") {
+        new_level = User::None;
+      } else if (request->value() == "operator") {
+        new_level = User::Operator;
+      } else if (request->value() == "admin") {
+        new_level = User::Admin;
+      } else {
         response->set_ok(false);
-        response->set_reason(res.error());
+        response->set_reason(
+            fmt::format("Unknown admin level '{}'", request->value()));
         return grpc::Status::OK;
       }
+      if (new_level > user_level) {
+        response->set_ok(false);
+        response->set_reason(
+            "Permission error : You cannot modify a user's permissions to "
+            "which greater than your own permissions");
+        return grpc::Status::OK;
+      }
+    }
+  }
 
-      modify_res = g_account_manager->ModifyQos(
-          request->name(), request->item(), request->value());
-    } break;
+    modify_res = g_account_manager->ModifyUser(
+        request->type(), request->name(), request->partition(),
+        request->account(), request->item(), request->value(),
+        request->force());
+    break;
 
-    default:
-      break;
+  case crane::grpc::Qos: {
+    auto res = g_account_manager->CheckUidIsAdmin(request->uid());
+
+    if (res.has_error()) {
+      response->set_ok(false);
+      response->set_reason(res.error());
+      return grpc::Status::OK;
+    }
+
+    modify_res = g_account_manager->ModifyQos(request->name(), request->item(),
+                                              request->value());
+  } break;
+
+  default:
+    break;
   }
   if (modify_res.ok) {
     response->set_ok(true);
@@ -585,6 +526,7 @@ grpc::Status CraneCtldServiceImpl::QueryEntityInfo(
   std::list<std::string> user_accounts;
   std::unordered_map<std::string, Account> res_account_map;
   std::unordered_map<uid_t, User> res_user_map;
+  std::unordered_map<std::string, Qos> res_qos_map;
 
   AccountManager::Result find_res =
       g_account_manager->FindUserLevelAccountsOfUid(request->uid(), &user_level,
@@ -596,74 +538,172 @@ grpc::Status CraneCtldServiceImpl::QueryEntityInfo(
   }
 
   switch (request->entity_type()) {
-    case crane::grpc::Account:
-      if (request->name().empty()) {
-        AccountManager::AccountMapMutexSharedPtr account_map_shared_ptr =
-            g_account_manager->GetAllAccountInfo();
-        if (account_map_shared_ptr) {
-          if (user_level != User::None) {
-            // If an administrator user queries account information, all
-            // accounts are returned, variable user_account not used
-            for (const auto &[name, account] : *account_map_shared_ptr) {
-              if (account->deleted) {
-                continue;
-              }
-              res_account_map.try_emplace(account->name, *account);
+  case crane::grpc::Account:
+    if (request->name().empty()) {
+      AccountManager::AccountMapMutexSharedPtr account_map_shared_ptr =
+          g_account_manager->GetAllAccountInfo();
+      if (account_map_shared_ptr) {
+        if (user_level != User::None) {
+          // If an administrator user queries account information, all
+          // accounts are returned, variable user_account not used
+          for (const auto &[name, account] : *account_map_shared_ptr) {
+            if (account->deleted) {
+              continue;
             }
-          } else {
-            // Otherwise, only all sub-accounts under your own accounts will be
-            // returned
-            std::queue<std::string> queue;
-            for (const auto &acct : user_accounts) {
-              // Z->A->B--->C->E
-              //    |->D    |->F
-              // If we query account C, [Z,A,B,C,E,F] is included.
-              std::string p_name =
-                  account_map_shared_ptr->at(acct)->parent_account;
-              while (!p_name.empty()) {
-                res_account_map.try_emplace(
-                    p_name, *(account_map_shared_ptr->at(p_name)));
-                p_name = account_map_shared_ptr->at(p_name)->parent_account;
-              }
+            res_account_map.try_emplace(account->name, *account);
+          }
+        } else {
+          // Otherwise, only all sub-accounts under your own accounts will be
+          // returned
+          std::queue<std::string> queue;
+          for (const auto &acct : user_accounts) {
+            // Z->A->B--->C->E
+            //    |->D    |->F
+            // If we query account C, [Z,A,B,C,E,F] is included.
+            std::string p_name =
+                account_map_shared_ptr->at(acct)->parent_account;
+            while (!p_name.empty()) {
+              res_account_map.try_emplace(
+                  p_name, *(account_map_shared_ptr->at(p_name)));
+              p_name = account_map_shared_ptr->at(p_name)->parent_account;
+            }
 
-              queue.push(acct);
-              while (!queue.empty()) {
-                std::string father = queue.front();
-                res_account_map.try_emplace(
-                    account_map_shared_ptr->at(father)->name,
-                    *(account_map_shared_ptr->at(father)));
-                queue.pop();
-                for (const auto &child :
-                     account_map_shared_ptr->at(father)->child_accounts) {
-                  queue.push(child);
-                }
+            queue.push(acct);
+            while (!queue.empty()) {
+              std::string father = queue.front();
+              res_account_map.try_emplace(
+                  account_map_shared_ptr->at(father)->name,
+                  *(account_map_shared_ptr->at(father)));
+              queue.pop();
+              for (const auto &child :
+                   account_map_shared_ptr->at(father)->child_accounts) {
+                queue.push(child);
               }
             }
           }
-          response->set_ok(true);
-        } else {
+        }
+        response->set_ok(true);
+      } else {
+        response->set_ok(false);
+        response->set_reason("Can't find any account!");
+        return grpc::Status::OK;
+      }
+    } else {
+      // Query an account
+      Account temp;
+      {
+        AccountManager::AccountMutexSharedPtr account_shared_ptr =
+            g_account_manager->GetExistedAccountInfo(request->name());
+        if (!account_shared_ptr) {
           response->set_ok(false);
-          response->set_reason("Can't find any account!");
+          response->set_reason(
+              fmt::format("Can't find account {}!", request->name()));
           return grpc::Status::OK;
         }
-      } else {
-        // Query an account
-        Account temp;
-        {
-          AccountManager::AccountMutexSharedPtr account_shared_ptr =
-              g_account_manager->GetExistedAccountInfo(request->name());
-          if (!account_shared_ptr) {
-            response->set_ok(false);
-            response->set_reason(
-                fmt::format("Can't find account {}!", request->name()));
-            return grpc::Status::OK;
-          }
-          temp = *account_shared_ptr;
-        }
+        temp = *account_shared_ptr;
+      }
 
+      AccountManager::Result judge_res =
+          g_account_manager->HasPermissionToAccount(request->uid(),
+                                                    request->name(), true);
+
+      if (!judge_res.ok) {
+        response->set_ok(false);
+        response->set_reason(judge_res.reason);
+        return grpc::Status::OK;
+      }
+
+      res_account_map.emplace(temp.name, std::move(temp));
+      response->set_ok(true);
+    }
+
+    for (const auto &it : res_account_map) {
+      const auto &account = it.second;
+      // put the account info into grpc element
+      auto *account_info = response->mutable_account_list()->Add();
+      account_info->set_name(account.name);
+      account_info->set_description(account.description);
+
+      auto *user_list = account_info->mutable_users();
+      for (auto &&user : account.users) {
+        user_list->Add()->assign(user);
+      }
+
+      auto *child_list = account_info->mutable_child_accounts();
+      for (auto &&child : account.child_accounts) {
+        child_list->Add()->assign(child);
+      }
+      account_info->set_parent_account(account.parent_account);
+
+      auto *partition_list = account_info->mutable_allowed_partitions();
+      for (auto &&partition : account.allowed_partition) {
+        partition_list->Add()->assign(partition);
+      }
+      account_info->set_default_qos(account.default_qos);
+      account_info->set_blocked(account.blocked);
+
+      auto *allowed_qos_list = account_info->mutable_allowed_qos_list();
+      for (auto &&qos : account.allowed_qos_list) {
+        allowed_qos_list->Add()->assign(qos);
+      }
+
+      auto *coordinators = account_info->mutable_coordinators();
+      for (auto &&coord : account.coordinators) {
+        coordinators->Add()->assign(coord);
+      }
+    }
+    break;
+  case crane::grpc::User:
+    if (request->name().empty()) {
+      AccountManager::UserMapMutexSharedPtr user_map_shared_ptr =
+          g_account_manager->GetAllUserInfo();
+
+      if (user_map_shared_ptr) {
+        if (user_level != User::None) {
+          // The rules for querying user information are the same as those for
+          // querying accounts
+          for (const auto &[user_name, user] : *user_map_shared_ptr) {
+            if (user->deleted) {
+              continue;
+            }
+            res_user_map.try_emplace(user->uid, *user);
+          }
+        } else {
+          AccountManager::AccountMapMutexSharedPtr account_map_shared_ptr =
+              g_account_manager->GetAllAccountInfo();
+
+          std::queue<std::string> queue;
+          for (const auto &acct : user_accounts) {
+            queue.push(acct);
+            while (!queue.empty()) {
+              std::string father = queue.front();
+              for (const auto &user :
+                   account_map_shared_ptr->at(father)->users) {
+                res_user_map.try_emplace(user_map_shared_ptr->at(user)->uid,
+                                         *(user_map_shared_ptr->at(user)));
+              }
+              queue.pop();
+              for (const auto &child :
+                   account_map_shared_ptr->at(father)->child_accounts) {
+                queue.push(child);
+              }
+            }
+          }
+        }
+        response->set_ok(true);
+      } else {
+        response->set_ok(false);
+        response->set_reason("Can't find any user!");
+        return grpc::Status::OK;
+      }
+
+    } else {
+      AccountManager::UserMutexSharedPtr user_shared_ptr =
+          g_account_manager->GetExistedUserInfo(request->name());
+      if (user_shared_ptr) {
         AccountManager::Result judge_res =
-            g_account_manager->HasPermissionToAccount(request->uid(),
-                                                      request->name());
+            g_account_manager->HasPermissionToUser(request->uid(),
+                                                   request->name(), true);
 
         if (!judge_res.ok) {
           response->set_ok(false);
@@ -671,184 +711,141 @@ grpc::Status CraneCtldServiceImpl::QueryEntityInfo(
           return grpc::Status::OK;
         }
 
-        res_account_map.emplace(temp.name, std::move(temp));
+        res_user_map.try_emplace(user_shared_ptr->uid, *user_shared_ptr);
         response->set_ok(true);
-      }
-
-      for (const auto it : res_account_map) {
-        const auto &account = it.second;
-        // put the account info into grpc element
-        auto *account_info = response->mutable_account_list()->Add();
-        account_info->set_name(account.name);
-        account_info->set_description(account.description);
-
-        auto *user_list = account_info->mutable_users();
-        for (auto &&user : account.users) {
-          user_list->Add()->assign(user);
-        }
-
-        auto *child_list = account_info->mutable_child_accounts();
-        for (auto &&child : account.child_accounts) {
-          child_list->Add()->assign(child);
-        }
-        account_info->set_parent_account(account.parent_account);
-
-        auto *partition_list = account_info->mutable_allowed_partitions();
-        for (auto &&partition : account.allowed_partition) {
-          partition_list->Add()->assign(partition);
-        }
-        account_info->set_default_qos(account.default_qos);
-        account_info->set_blocked(account.blocked);
-
-        auto *allowed_qos_list = account_info->mutable_allowed_qos_list();
-        for (const auto &qos : account.allowed_qos_list) {
-          allowed_qos_list->Add()->assign(qos);
-        }
-      }
-      break;
-    case crane::grpc::User:
-      if (request->name().empty()) {
-        AccountManager::UserMapMutexSharedPtr user_map_shared_ptr =
-            g_account_manager->GetAllUserInfo();
-
-        if (user_map_shared_ptr) {
-          if (user_level != User::None) {
-            // The rules for querying user information are the same as those for
-            // querying accounts
-            for (const auto &[user_name, user] : *user_map_shared_ptr) {
-              if (user->deleted) {
-                continue;
-              }
-              res_user_map.try_emplace(user->uid, *user);
-            }
-          } else {
-            AccountManager::AccountMapMutexSharedPtr account_map_shared_ptr =
-                g_account_manager->GetAllAccountInfo();
-
-            std::queue<std::string> queue;
-            for (const auto &acct : user_accounts) {
-              queue.push(acct);
-              while (!queue.empty()) {
-                std::string father = queue.front();
-                for (const auto &user :
-                     account_map_shared_ptr->at(father)->users) {
-                  res_user_map.try_emplace(user_map_shared_ptr->at(user)->uid,
-                                           *(user_map_shared_ptr->at(user)));
-                }
-                queue.pop();
-                for (const auto &child :
-                     account_map_shared_ptr->at(father)->child_accounts) {
-                  queue.push(child);
-                }
-              }
-            }
-          }
-          response->set_ok(true);
-        } else {
-          response->set_ok(false);
-          response->set_reason("Can't find any user!");
-          return grpc::Status::OK;
-        }
-
       } else {
-        AccountManager::UserMutexSharedPtr user_shared_ptr =
-            g_account_manager->GetExistedUserInfo(request->name());
-        if (user_shared_ptr) {
-          AccountManager::Result judge_res =
-              g_account_manager->HasPermissionToUser(request->uid(),
-                                                     request->name());
+        response->set_ok(false);
+        response->set_reason(
+            fmt::format("Can't find user {}", request->name()));
+        return grpc::Status::OK;
+      }
+    }
 
-          if (!judge_res.ok) {
-            response->set_ok(false);
-            response->set_reason(judge_res.reason);
-            return grpc::Status::OK;
-          }
-
-          res_user_map.try_emplace(user_shared_ptr->uid, *user_shared_ptr);
-          response->set_ok(true);
+    for (const auto &it : res_user_map) {
+      const auto &user = it.second;
+      for (const auto &[account, item] : user.account_to_attrs_map) {
+        if (!request->account().empty() && account != request->account()) {
+          continue;
+        }
+        auto *user_info = response->mutable_user_list()->Add();
+        user_info->set_name(user.name);
+        user_info->set_uid(user.uid);
+        if (account == user.default_account) {
+          user_info->set_account(account + '*');
         } else {
+          user_info->set_account(account);
+        }
+        user_info->set_admin_level(
+            (crane::grpc::UserInfo_AdminLevel)user.admin_level);
+        user_info->set_blocked(item.blocked);
+
+        auto *partition_qos_list =
+            user_info->mutable_allowed_partition_qos_list();
+        for (const auto &[par_name, pair] : item.allowed_partition_qos_map) {
+          auto *partition_qos = partition_qos_list->Add();
+          partition_qos->set_partition_name(par_name);
+          partition_qos->set_default_qos(pair.first);
+
+          auto *qos_list = partition_qos->mutable_qos_list();
+          for (const auto &qos : pair.second) {
+            qos_list->Add()->assign(qos);
+          }
+        }
+
+        auto *coordinated_accounts = user_info->mutable_coordinator_accounts();
+        for (auto &&coord : user.coordinator_accounts) {
+          coordinated_accounts->Add()->assign(coord);
+        }
+      }
+    }
+    break;
+  case crane::grpc::Qos: {
+    PasswordEntry entry(request->uid());
+
+    AccountManager::UserMutexSharedPtr user_shared_ptr =
+        g_account_manager->GetExistedUserInfo(entry.Username());
+    if (!user_shared_ptr) {
+      response->set_ok(false);
+      response->set_reason(
+          fmt::format("User {} is not a user of Crane.", entry.Username()));
+      return grpc::Status::OK;
+    }
+
+    if (request->name().empty()) {
+      AccountManager::QosMapMutexSharedPtr qos_map_shared_ptr =
+          g_account_manager->GetAllQosInfo();
+
+      if (qos_map_shared_ptr) {
+        if (user_level != User::None) {
+          for (const auto &[name, qos] : *qos_map_shared_ptr) {
+            if (qos->deleted) continue;
+            res_qos_map[name] = *qos;
+          }
+        } else {
+          for (const auto &[acct, item] :
+               user_shared_ptr->account_to_attrs_map) {
+            for (const auto &[part, part_qos_map] :
+                 item.allowed_partition_qos_map) {
+              for (const auto &qos : part_qos_map.second) {
+                res_qos_map[qos] = *(qos_map_shared_ptr->at(qos));
+              }
+            }
+          }
+        }
+      } else {
+        response->set_ok(false);
+        response->set_reason("Can't find any QOS!");
+        return grpc::Status::OK;
+      }
+    } else {
+      AccountManager::QosMutexSharedPtr qos_shared_ptr =
+          g_account_manager->GetExistedQosInfo(request->name());
+      if (!qos_shared_ptr) {
+        response->set_ok(false);
+        response->set_reason(
+            fmt::format("Can't find QOS {}!", request->name()));
+        return grpc::Status::OK;
+      }
+
+      if (user_level == User::None) {
+        bool found = false;
+        for (const auto &[acct, item] : user_shared_ptr->account_to_attrs_map) {
+          for (const auto &[part, part_qos_map] :
+               item.allowed_partition_qos_map) {
+            for (const auto &qos : part_qos_map.second) {
+              if (qos == request->name()) found = true;
+            }
+          }
+        }
+
+        if (!found) {
           response->set_ok(false);
           response->set_reason(
-              fmt::format("Can't find user {}", request->name()));
+              fmt::format("User {} is not allowed to access qos {} which is "
+                          "not in allowed qos list",
+                          entry.Username(), request->name()));
           return grpc::Status::OK;
         }
       }
 
-      for (const auto it : res_user_map) {
-        const auto &user = it.second;
-        for (const auto &[account, item] : user.account_to_attrs_map) {
-          if (!request->account().empty() && account != request->account()) {
-            continue;
-          }
-          auto *user_info = response->mutable_user_list()->Add();
-          user_info->set_name(user.name);
-          user_info->set_uid(user.uid);
-          if (account == user.default_account) {
-            user_info->set_account(account + '*');
-          } else {
-            user_info->set_account(account);
-          }
-          user_info->set_admin_level(
-              (crane::grpc::UserInfo_AdminLevel)user.admin_level);
-          user_info->set_blocked(item.blocked);
+      res_qos_map[request->name()] = *qos_shared_ptr;
+    }
 
-          auto *partition_qos_list =
-              user_info->mutable_allowed_partition_qos_list();
-          for (const auto &[par_name, pair] : item.allowed_partition_qos_map) {
-            auto *partition_qos = partition_qos_list->Add();
-            partition_qos->set_partition_name(par_name);
-            partition_qos->set_default_qos(pair.first);
-
-            auto *qos_list = partition_qos->mutable_qos_list();
-            for (const auto &qos : pair.second) {
-              qos_list->Add()->assign(qos);
-            }
-          }
-        }
-      }
-      break;
-    case crane::grpc::Qos:
-      if (request->name().empty()) {
-        AccountManager::QosMapMutexSharedPtr qos_map_shared_ptr =
-            g_account_manager->GetAllQosInfo();
-
-        if (qos_map_shared_ptr) {
-          auto *list = response->mutable_qos_list();
-          for (const auto &[name, qos] : *qos_map_shared_ptr) {
-            if (qos->deleted) {
-              continue;
-            }
-
-            auto *qos_info = list->Add();
-            qos_info->set_name(qos->name);
-            qos_info->set_description(qos->description);
-            qos_info->set_priority(qos->priority);
-            qos_info->set_max_jobs_per_user(qos->max_jobs_per_user);
-            qos_info->set_max_cpus_per_user(qos->max_cpus_per_user);
-            qos_info->set_max_time_limit_per_task(
-                absl::ToInt64Seconds(qos->max_time_limit_per_task));
-          }
-        }
-        response->set_ok(true);
-      } else {
-        AccountManager::QosMutexSharedPtr qos_shared_ptr =
-            g_account_manager->GetExistedQosInfo(request->name());
-        if (qos_shared_ptr) {
-          auto *qos_info = response->mutable_qos_list()->Add();
-          qos_info->set_name(qos_shared_ptr->name);
-          qos_info->set_description(qos_shared_ptr->description);
-          qos_info->set_priority(qos_shared_ptr->priority);
-          qos_info->set_max_jobs_per_user(qos_shared_ptr->max_jobs_per_user);
-          qos_info->set_max_cpus_per_user(qos_shared_ptr->max_cpus_per_user);
-          qos_info->set_max_time_limit_per_task(
-              absl::ToInt64Seconds(qos_shared_ptr->max_time_limit_per_task));
-          response->set_ok(true);
-        } else {
-          response->set_ok(false);
-        }
-      }
-    default:
-      break;
+    response->set_ok(true);
+    auto *list = response->mutable_qos_list();
+    for (const auto &[name, qos] : res_qos_map) {
+      auto *qos_info = list->Add();
+      qos_info->set_name(qos.name);
+      qos_info->set_description(qos.description);
+      qos_info->set_priority(qos.priority);
+      qos_info->set_max_jobs_per_user(qos.max_jobs_per_user);
+      qos_info->set_max_cpus_per_user(qos.max_cpus_per_user);
+      qos_info->set_max_time_limit_per_task(
+          absl::ToInt64Seconds(qos.max_time_limit_per_task));
+    }
+  }
+  default:
+    break;
   }
   return grpc::Status::OK;
 }
@@ -861,65 +858,43 @@ grpc::Status CraneCtldServiceImpl::DeleteEntity(
   AccountManager::Result res;
 
   switch (request->entity_type()) {
-    case crane::grpc::User: {
-      AccountManager::UserMutexSharedPtr deleter_shared_ptr =
-          g_account_manager->GetExistedUserInfo(request->name());
-      if (!deleter_shared_ptr) {
-        response->set_ok(false);
-        response->set_reason(
-            fmt::format("User '{}' is not a crane user", request->name()));
-        return grpc::Status::OK;
-      }
+  case crane::grpc::User: {
+    AccountManager::UserMutexSharedPtr deleter_shared_ptr =
+        g_account_manager->GetExistedUserInfo(request->name());
+    if (!deleter_shared_ptr) {
+      response->set_ok(false);
+      response->set_reason(
+          fmt::format("User '{}' is not a crane user", request->name()));
+      return grpc::Status::OK;
+    }
 
-      if (request->account().empty()) {
-        // Remove user from all of it's accounts
-        AccountManager::Result judge_res =
-            g_account_manager->HasPermissionToAccount(
-                request->uid(), deleter_shared_ptr->default_account,
-                &user_level);
-        if (user_level == User::None) {
-          if (deleter_shared_ptr->account_to_attrs_map.size() != 1) {
+    if (request->account().empty()) {
+      // Remove user from all of it's accounts
+      AccountManager::Result judge_res =
+          g_account_manager->HasPermissionToAccount(
+              request->uid(), deleter_shared_ptr->default_account, false,
+              &user_level);
+      if (user_level == User::None) {
+        if (deleter_shared_ptr->account_to_attrs_map.size() != 1) {
+          response->set_ok(false);
+          response->set_reason(
+              "Permission error : You can't remove user form more than one "
+              "account at a time");
+          return grpc::Status::OK;
+        } else {
+          if (!judge_res.ok) {
             response->set_ok(false);
-            response->set_reason(
-                "Permission error : You can't remove user form more than one "
-                "account at a time");
+            response->set_reason(judge_res.reason);
             return grpc::Status::OK;
-          } else {
-            if (!judge_res.ok) {
-              response->set_ok(false);
-              response->set_reason(judge_res.reason);
-              return grpc::Status::OK;
-            }
           }
         }
-
-      } else {
-        // Remove user from specific account
-        AccountManager::Result judge_res =
-            g_account_manager->HasPermissionToAccount(
-                request->uid(), request->account(), &user_level);
-
-        if (!judge_res.ok) {
-          response->set_ok(false);
-          response->set_reason(judge_res.reason);
-          return grpc::Status::OK;
-        }
       }
 
-      if (user_level <= deleter_shared_ptr->admin_level) {
-        response->set_ok(false);
-        response->set_reason(
-            "Permission error : You cannot delete a user with the same or "
-            "greater permissions as yourself");
-        return grpc::Status::OK;
-      }
-    }
-      res = g_account_manager->DeleteUser(request->name(), request->account());
-      break;
-    case crane::grpc::Account: {
+    } else {
+      // Remove user from specific account
       AccountManager::Result judge_res =
-          g_account_manager->HasPermissionToAccount(request->uid(),
-                                                    request->name());
+          g_account_manager->HasPermissionToAccount(
+              request->uid(), request->account(), false, &user_level);
 
       if (!judge_res.ok) {
         response->set_ok(false);
@@ -927,21 +902,43 @@ grpc::Status CraneCtldServiceImpl::DeleteEntity(
         return grpc::Status::OK;
       }
     }
-      res = g_account_manager->DeleteAccount(request->name());
-      break;
-    case crane::grpc::Qos: {
-      auto judge_res = g_account_manager->CheckUidIsAdmin(request->uid());
 
-      if (judge_res.has_error()) {
-        response->set_ok(false);
-        response->set_reason(judge_res.error());
-        return grpc::Status::OK;
-      }
+    if (user_level <= deleter_shared_ptr->admin_level) {
+      response->set_ok(false);
+      response->set_reason(
+          "Permission error : You cannot delete a user with the same or "
+          "greater permissions as yourself");
+      return grpc::Status::OK;
     }
-      res = g_account_manager->DeleteQos(request->name());
-      break;
-    default:
-      break;
+  }
+    res = g_account_manager->DeleteUser(request->name(), request->account());
+    break;
+  case crane::grpc::Account: {
+    AccountManager::Result judge_res =
+        g_account_manager->HasPermissionToAccount(request->uid(),
+                                                  request->name(), false);
+
+    if (!judge_res.ok) {
+      response->set_ok(false);
+      response->set_reason(judge_res.reason);
+      return grpc::Status::OK;
+    }
+  }
+    res = g_account_manager->DeleteAccount(request->name());
+    break;
+  case crane::grpc::Qos: {
+    auto judge_res = g_account_manager->CheckUidIsAdmin(request->uid());
+
+    if (judge_res.has_error()) {
+      response->set_ok(false);
+      response->set_reason(judge_res.error());
+      return grpc::Status::OK;
+    }
+  }
+    res = g_account_manager->DeleteQos(request->name());
+    break;
+  default:
+    break;
   }
 
   if (res.ok) {
@@ -960,35 +957,35 @@ grpc::Status CraneCtldServiceImpl::BlockAccountOrUser(
   AccountManager::Result res;
 
   switch (request->entity_type()) {
-    case crane::grpc::Account:
-      res = g_account_manager->HasPermissionToAccount(request->uid(),
-                                                      request->name());
+  case crane::grpc::Account:
+    res = g_account_manager->HasPermissionToAccount(request->uid(),
+                                                    request->name(), false);
 
-      if (!res.ok) {
-        response->set_ok(false);
-        response->set_reason(res.reason);
-        return grpc::Status::OK;
-      }
-      res = g_account_manager->BlockAccount(request->name(), request->block());
-      response->set_ok(res.ok);
+    if (!res.ok) {
+      response->set_ok(false);
       response->set_reason(res.reason);
-      break;
-    case crane::grpc::User:
-      res = g_account_manager->HasPermissionToUser(request->uid(),
-                                                   request->name());
+      return grpc::Status::OK;
+    }
+    res = g_account_manager->BlockAccount(request->name(), request->block());
+    response->set_ok(res.ok);
+    response->set_reason(res.reason);
+    break;
+  case crane::grpc::User:
+    res = g_account_manager->HasPermissionToUser(request->uid(),
+                                                 request->name(), false);
 
-      if (!res.ok) {
-        response->set_ok(false);
-        response->set_reason(res.reason);
-        return grpc::Status::OK;
-      }
-      res = g_account_manager->BlockUser(request->name(), request->account(),
-                                         request->block());
-      response->set_ok(res.ok);
+    if (!res.ok) {
+      response->set_ok(false);
       response->set_reason(res.reason);
-      break;
-    default:
-      break;
+      return grpc::Status::OK;
+    }
+    res = g_account_manager->BlockUser(request->name(), request->account(),
+                                       request->block());
+    response->set_ok(res.ok);
+    response->set_reason(res.reason);
+    break;
+  default:
+    break;
   }
   return grpc::Status::OK;
 }
@@ -1005,6 +1002,7 @@ grpc::Status CraneCtldServiceImpl::CforedStream(
     grpc::ServerContext *context,
     grpc::ServerReaderWriter<crane::grpc::StreamCtldReply,
                              crane::grpc::StreamCforedRequest> *stream) {
+  using crane::grpc::InteractiveTaskType;
   using crane::grpc::StreamCforedRequest;
   using crane::grpc::StreamCtldReply;
   using grpc::Status;
@@ -1019,7 +1017,8 @@ grpc::Status CraneCtldServiceImpl::CforedStream(
 
   StreamCforedRequest cfored_request;
 
-  CforedStreamWriter stream_writer(stream);
+  auto stream_writer = std::make_shared<CforedStreamWriter>(stream);
+  std::weak_ptr<CforedStreamWriter> writer_weak_ptr(stream_writer);
   std::string cfored_name;
 
   CRANE_TRACE("CforedStream from {} created.", context->peer());
@@ -1027,141 +1026,152 @@ grpc::Status CraneCtldServiceImpl::CforedStream(
   StreamState state = StreamState::kWaitRegReq;
   while (true) {
     switch (state) {
-      case StreamState::kWaitRegReq:
-        ok = stream->Read(&cfored_request);
-        if (ok) {
-          if (cfored_request.type() !=
-              StreamCforedRequest::CFORED_REGISTRATION) {
-            CRANE_ERROR("Expect type CFORED_REGISTRATION from peer {}.",
-                        context->peer());
-            return Status::CANCELLED;
-          } else {
-            cfored_name = cfored_request.payload_cfored_reg().cfored_name();
-            CRANE_INFO("Cfored {} registered.", cfored_name);
+    case StreamState::kWaitRegReq:
+      ok = stream->Read(&cfored_request);
+      if (ok) {
+        if (cfored_request.type() != StreamCforedRequest::CFORED_REGISTRATION) {
+          CRANE_ERROR("Expect type CFORED_REGISTRATION from peer {}.",
+                      context->peer());
+          return Status::CANCELLED;
+        } else {
+          cfored_name = cfored_request.payload_cfored_reg().cfored_name();
+          CRANE_INFO("Cfored {} registered.", cfored_name);
 
-            ok = stream_writer.WriteCforedRegistrationAck({});
-            if (ok) {
-              state = StreamState::kWaitMsg;
-            } else {
-              CRANE_ERROR(
-                  "Failed to send msg to cfored {}. Connection is broken. "
-                  "Exiting...",
-                  cfored_name);
-              state = StreamState::kCleanData;
+          ok = stream_writer->WriteCforedRegistrationAck({});
+          if (ok) {
+            state = StreamState::kWaitMsg;
+          } else {
+            CRANE_ERROR(
+                "Failed to send msg to cfored {}. Connection is broken. "
+                "Exiting...",
+                cfored_name);
+            state = StreamState::kCleanData;
+          }
+        }
+      } else {
+        state = StreamState::kCleanData;
+      }
+
+      break;
+
+    case StreamState::kWaitMsg: {
+      ok = stream->Read(&cfored_request);
+      if (ok) {
+        switch (cfored_request.type()) {
+        case StreamCforedRequest::TASK_REQUEST: {
+          auto const &payload = cfored_request.payload_task_req();
+          auto task = std::make_unique<TaskInCtld>();
+          task->SetFieldsByTaskToCtld(payload.task());
+
+          auto &meta = std::get<InteractiveMetaInTask>(task->meta);
+          auto i_type = meta.interactive_type;
+
+          meta.cb_task_res_allocated =
+              [writer_weak_ptr](task_id_t task_id,
+                                std::string const &allocated_craned_regex,
+                                std::list<std::string> const &craned_ids) {
+                if (auto writer = writer_weak_ptr.lock(); writer)
+                  writer->WriteTaskResAllocReply(
+                      task_id,
+                      {std::make_pair(allocated_craned_regex, craned_ids)});
+              };
+
+          meta.cb_task_cancel = [writer_weak_ptr](task_id_t task_id) {
+            if (auto writer = writer_weak_ptr.lock(); writer)
+              writer->WriteTaskCancelRequest(task_id);
+          };
+
+          meta.cb_task_completed = [this, i_type, cfored_name,
+                                    writer_weak_ptr](task_id_t task_id) {
+            CRANE_TRACE("Sending TaskCompletionAckReply in task_completed",
+                        task_id);
+            if (auto writer = writer_weak_ptr.lock(); writer)
+              writer->WriteTaskCompletionAckReply(task_id);
+            m_ctld_server_->m_mtx_.Lock();
+
+            // If cfored disconnected, the cfored_name should have be
+            // removed from the map and the task completion callback is
+            // generated from cleaning the remaining tasks by calling
+            // g_task_scheduler->TerminateTask(), we should ignore this
+            // callback since the task id has already been cleaned.
+            auto iter =
+                m_ctld_server_->m_cfored_running_tasks_.find(cfored_name);
+            if (iter != m_ctld_server_->m_cfored_running_tasks_.end())
+              iter->second.erase(task_id);
+            m_ctld_server_->m_mtx_.Unlock();
+          };
+
+          auto submit_result =
+              m_ctld_server_->SubmitTaskToScheduler(std::move(task));
+          result::result<task_id_t, std::string> result;
+          if (submit_result.has_value()) {
+            result = result::result<task_id_t, std::string>{
+                submit_result.value().get()};
+          } else {
+            result = result::fail(submit_result.error());
+          }
+          ok = stream_writer->WriteTaskIdReply(payload.pid(), result);
+
+          if (!ok) {
+            CRANE_ERROR(
+                "Failed to send msg to cfored {}. Connection is broken. "
+                "Exiting...",
+                cfored_name);
+            state = StreamState::kCleanData;
+          } else {
+            if (result.has_value()) {
+              m_ctld_server_->m_mtx_.Lock();
+              m_ctld_server_->m_cfored_running_tasks_[cfored_name].emplace(
+                  result.value());
+              m_ctld_server_->m_mtx_.Unlock();
             }
           }
-        } else {
+        } break;
+
+        case StreamCforedRequest::TASK_COMPLETION_REQUEST: {
+          auto const &payload = cfored_request.payload_task_complete_req();
+          CRANE_TRACE("Recv TaskCompletionReq of Task #{}", payload.task_id());
+
+          if (g_task_scheduler->TerminatePendingOrRunningTask(
+                  payload.task_id()) != CraneErr::kOk)
+            stream_writer->WriteTaskCompletionAckReply(payload.task_id());
+        } break;
+
+        case StreamCforedRequest::CFORED_GRACEFUL_EXIT: {
+          stream_writer->WriteCforedGracefulExitAck();
+          stream_writer->Invalidate();
           state = StreamState::kCleanData;
+        } break;
+
+        default:
+          CRANE_ERROR("Not expected cfored request type: {}",
+                      StreamCforedRequest_CforedRequestType_Name(
+                          cfored_request.type()));
+          return Status::CANCELLED;
         }
-
-        break;
-
-      case StreamState::kWaitMsg: {
-        ok = stream->Read(&cfored_request);
-        if (ok) {
-          switch (cfored_request.type()) {
-            case StreamCforedRequest::TASK_REQUEST: {
-              auto const &payload = cfored_request.payload_task_req();
-              auto task = std::make_unique<TaskInCtld>();
-              task->SetFieldsByTaskToCtld(payload.task());
-
-              auto &meta = std::get<InteractiveMetaInTask>(task->meta);
-              meta.cb_task_res_allocated =
-                  [writer = &stream_writer](
-                      task_id_t task_id,
-                      std::string const &allocated_craned_regex) {
-                    writer->WriteTaskResAllocReply(task_id,
-                                                   {allocated_craned_regex});
-                  };
-
-              meta.cb_task_cancel = [writer =
-                                         &stream_writer](task_id_t task_id) {
-                writer->WriteTaskCancelRequest(task_id);
-              };
-
-              meta.cb_task_completed = [&, cfored_name](task_id_t task_id) {
-                m_ctld_server_->m_mtx_.Lock();
-
-                // If cfored disconnected, the cfored_name should have be
-                // removed from the map and the task completion callback is
-                // generated from cleaning the remaining tasks by calling
-                // g_task_scheduler->TerminateTask(), we should ignore this
-                // callback since the task id has already been cleaned.
-                auto iter =
-                    m_ctld_server_->m_cfored_running_tasks_.find(cfored_name);
-                if (iter != m_ctld_server_->m_cfored_running_tasks_.end())
-                  iter->second.erase(task_id);
-                m_ctld_server_->m_mtx_.Unlock();
-              };
-
-              auto result =
-                  m_ctld_server_->SubmitTaskToScheduler(std::move(task));
-
-              ok = stream_writer.WriteTaskIdReply(payload.pid(),
-                                                  std::move(result));
-              if (!ok) {
-                CRANE_ERROR(
-                    "Failed to send msg to cfored {}. Connection is broken. "
-                    "Exiting...",
-                    cfored_name);
-                state = StreamState::kCleanData;
-              } else {
-                if (result.has_value()) {
-                  m_ctld_server_->m_mtx_.Lock();
-                  m_ctld_server_->m_cfored_running_tasks_[cfored_name].emplace(
-                      result.value().get());
-                  m_ctld_server_->m_mtx_.Unlock();
-                }
-              }
-            } break;
-
-            case StreamCforedRequest::TASK_COMPLETION_REQUEST: {
-              auto const &payload = cfored_request.payload_task_complete_req();
-
-              g_task_scheduler->TerminateRunningTask(payload.task_id());
-
-              ok = stream_writer.WriteTaskCompletionAckReply(payload.task_id());
-              if (!ok) {
-                state = StreamState::kCleanData;
-              }
-            } break;
-
-            case StreamCforedRequest::CFORED_GRACEFUL_EXIT: {
-              stream_writer.WriteCforedGracefulExitAck();
-              stream_writer.Invalidate();
-              state = StreamState::kCleanData;
-            } break;
-
-            default:
-              CRANE_ERROR("Not expected cfored request type: {}",
-                          StreamCforedRequest_CforedRequestType_Name(
-                              cfored_request.type()));
-              return Status::CANCELLED;
-          }
-        } else {
-          state = StreamState::kCleanData;
-        }
-      } break;
-
-      case StreamState::kCleanData: {
-        CRANE_INFO("Cfored {} disconnected. Cleaning its data...", cfored_name);
-
-        m_ctld_server_->m_mtx_.Lock();
-
-        auto const &running_task_set =
-            m_ctld_server_->m_cfored_running_tasks_[cfored_name];
-        std::vector<task_id_t> running_tasks(running_task_set.begin(),
-                                             running_task_set.end());
-        m_ctld_server_->m_cfored_running_tasks_.erase(cfored_name);
-
-        m_ctld_server_->m_mtx_.Unlock();
-
-        for (task_id_t task_id : running_tasks) {
-          g_task_scheduler->TerminateRunningTask(task_id);
-        }
-
-        return Status::OK;
+      } else {
+        state = StreamState::kCleanData;
       }
+    } break;
+
+    case StreamState::kCleanData: {
+      CRANE_INFO("Cfored {} disconnected. Cleaning its data...", cfored_name);
+      stream_writer->Invalidate();
+      m_ctld_server_->m_mtx_.Lock();
+
+      auto const &running_task_set =
+          m_ctld_server_->m_cfored_running_tasks_[cfored_name];
+      std::vector<task_id_t> running_tasks(running_task_set.begin(),
+                                           running_task_set.end());
+      m_ctld_server_->m_cfored_running_tasks_.erase(cfored_name);
+      m_ctld_server_->m_mtx_.Unlock();
+
+      for (task_id_t task_id : running_tasks) {
+        g_task_scheduler->TerminateRunningTask(task_id);
+      }
+
+      return Status::OK;
+    }
     }
   }
 }
@@ -1169,35 +1179,18 @@ grpc::Status CraneCtldServiceImpl::CforedStream(
 CtldServer::CtldServer(const Config::CraneCtldListenConf &listen_conf) {
   m_service_impl_ = std::make_unique<CraneCtldServiceImpl>(this);
 
-  std::string listen_addr_port =
-      fmt::format("{}:{}", listen_conf.CraneCtldListenAddr,
-                  listen_conf.CraneCtldListenPort);
-
   grpc::ServerBuilder builder;
 
-  if (g_config.CompressedRpc)
-    builder.SetDefaultCompressionAlgorithm(GRPC_COMPRESS_GZIP);
+  if (g_config.CompressedRpc) ServerBuilderSetCompression(&builder);
 
+  std::string cranectld_listen_addr = listen_conf.CraneCtldListenAddr;
   if (listen_conf.UseTls) {
-    grpc::SslServerCredentialsOptions::PemKeyCertPair pem_key_cert_pair;
-    pem_key_cert_pair.cert_chain = listen_conf.ServerCertContent;
-    pem_key_cert_pair.private_key = listen_conf.ServerKeyContent;
-
-    grpc::SslServerCredentialsOptions ssl_opts;
-    // pem_root_certs is actually the certificate of server side rather than
-    // CA certificate. CA certificate is not needed.
-    // Since we use the same cert/key pair for both cranectld/craned,
-    // pem_root_certs is set to the same certificate.
-    ssl_opts.pem_root_certs = listen_conf.ServerCertContent;
-    ssl_opts.pem_key_cert_pairs.emplace_back(std::move(pem_key_cert_pair));
-    ssl_opts.client_certificate_request =
-        GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-
-    builder.AddListeningPort(listen_addr_port,
-                             grpc::SslServerCredentials(ssl_opts));
+    ServerBuilderAddTcpTlsListeningPort(&builder, cranectld_listen_addr,
+                                        listen_conf.CraneCtldListenPort,
+                                        listen_conf.Certs);
   } else {
-    builder.AddListeningPort(listen_addr_port,
-                             grpc::InsecureServerCredentials());
+    ServerBuilderAddTcpInsecureListeningPort(&builder, cranectld_listen_addr,
+                                             listen_conf.CraneCtldListenPort);
   }
 
   builder.RegisterService(m_service_impl_.get());
@@ -1208,7 +1201,8 @@ CtldServer::CtldServer(const Config::CraneCtldListenConf &listen_conf) {
     std::exit(1);
   }
 
-  CRANE_INFO("CraneCtld is listening on {} and Tls is {}", listen_addr_port,
+  CRANE_INFO("CraneCtld is listening on {}:{} and Tls is {}",
+             cranectld_listen_addr, listen_conf.CraneCtldListenPort,
              listen_conf.UseTls);
 
   // Avoid the potential deadlock error in underlying absl::mutex
@@ -1295,16 +1289,22 @@ CtldServer::SubmitTaskToScheduler(std::unique_ptr<TaskInCtld> task) {
     return result::fail("Partition doesn't exist!");
   } else if (err == CraneErr::kInvalidNodeNum) {
     CRANE_DEBUG(
-        "Task submission failed. Reason: --node is either invalid or "
-        "greater than the number of alive nodes in its partition.");
+        "Task submission failed. Reason: --node is either invalid or greater "
+        "than the number of nodes in its partition.");
     return result::fail(
-        "--node is either invalid or greater than "
-        "the number of alive nodes in its partition.");
+        "--node is either invalid or greater than the number of nodes in its "
+        "partition.");
   } else if (err == CraneErr::kNoResource) {
     CRANE_DEBUG(
         "Task submission failed. "
         "Reason: The resources of the partition are insufficient.");
     return result::fail("The resources of the partition are insufficient");
+  } else if (err == CraneErr::kNoAvailNode) {
+    CRANE_DEBUG(
+        "Task submission failed. "
+        "Reason: Nodes satisfying the requirements of task are insufficient");
+    return result::fail(
+        "Nodes satisfying the requirements of task are insufficient.");
   } else if (err == CraneErr::kInvalidParam) {
     CRANE_DEBUG(
         "Task submission failed. "

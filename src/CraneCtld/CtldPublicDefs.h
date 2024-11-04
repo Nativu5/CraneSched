@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -29,6 +31,10 @@ using task_db_id_t = int64_t;
 // TaskScheduler Constants
 
 constexpr uint32_t kTaskScheduleIntervalMs = 1000;
+
+// Clean TaskHoldTimerQueue when timeout or exceeding batch num
+constexpr uint32_t kTaskHoldTimerTimeoutMs = 500;
+constexpr uint32_t kTaskHoldTimerBatchNum = 1000;
 
 // Clean CancelTaskQueue when timeout or exceeding batch num
 constexpr uint32_t kCancelTaskTimeoutMs = 500;
@@ -64,11 +70,15 @@ struct Config {
   struct Node {
     uint32_t cpu;
     uint64_t memory_bytes;
+    DedicatedResourceInNode dedicated_resource;
   };
 
   struct Partition {
     std::string nodelist_str;
     uint32_t priority;
+    uint64_t default_mem_per_cpu;
+    // optional, 0 indicates no limit
+    uint64_t max_mem_per_cpu;
     std::unordered_set<std::string> nodes;
     std::unordered_set<std::string> AllowAccounts;
   };
@@ -78,12 +88,9 @@ struct Config {
     std::string CraneCtldListenPort;
 
     bool UseTls{false};
-    std::string DomainSuffix;
-    std::string ServerCertFilePath;
-    std::string ServerCertContent;
-    std::string ServerKeyFilePath;
-    std::string ServerKeyContent;
+    TlsCertificates Certs;
   };
+  CraneCtldListenConf ListenConf;
 
   struct Priority {
     enum TypeEnum { Basic, MultiFactor };
@@ -98,9 +105,12 @@ struct Config {
     uint32_t WeightPartition;
     uint32_t WeightQOS;
   };
-  Priority PriorityConfig;
 
-  CraneCtldListenConf ListenConf;
+  struct PluginConfig {
+    bool Enabled{false};
+    std::string PlugindSockPath;
+  };
+
   bool CompressedRpc{};
 
   std::string CraneCtldDebugLevel;
@@ -119,12 +129,18 @@ struct Config {
   std::unordered_map<std::string, Partition> Partitions;
   std::string DefaultPartition;
 
+  Priority PriorityConfig;
+
+  // Database config
   std::string DbUser;
   std::string DbPassword;
   std::string DbHost;
   std::string DbPort;
   std::string DbRSName;
   std::string DbName;
+
+  // Plugin config
+  PluginConfig Plugin;
 
   uint32_t PendingQueueMaxSize;
   uint32_t ScheduledBatchSize;
@@ -150,7 +166,15 @@ struct CranedStaticMeta {
 
   std::list<std::string> partition_ids;  // Partitions to which
                                          // this craned belongs to
-  Resources res;
+  ResourceInNode res;
+};
+
+struct CranedRemoteMeta {
+  DedicatedResourceInNode dres_in_node;
+  SystemRelInfo sys_rel_info;
+  std::string craned_version;
+  absl::Time craned_start_time;
+  absl::Time system_boot_time;
 };
 
 /**
@@ -159,28 +183,32 @@ struct CranedStaticMeta {
  */
 struct CranedMeta {
   CranedStaticMeta static_meta;
+  CranedRemoteMeta remote_meta;
 
   bool alive{false};
 
   // total = avail + in-use
-  Resources res_total;  // A copy of res in CranedStaticMeta,
-  // just for convenience.
-  Resources res_avail;
-  Resources res_in_use;
+  ResourceInNode res_total;  // A copy of res in CranedStaticMeta,
+  ResourceInNode res_avail;
+  ResourceInNode res_in_use;
+
+  bool drain{false};
+  std::string state_reason;
+  absl::Time last_busy_time;
 
   // Store the information of the slices of allocated resource.
   // One task id owns one shard of allocated resource.
-  absl::flat_hash_map<task_id_t, Resources> running_task_resource_map;
+  absl::flat_hash_map<task_id_t, ResourceInNode> running_task_resource_map;
 };
 
 struct PartitionGlobalMeta {
   // total = avail + in-use
-  Resources m_resource_total_;
-  Resources m_resource_avail_;
-  Resources m_resource_in_use_;
+  ResourceView res_total;
+  ResourceView res_avail;
+  ResourceView res_in_use;
 
   // Include resources in unavailable nodes.
-  Resources m_resource_total_inc_dead_;
+  ResourceView res_total_inc_dead;
 
   std::string name;
   std::string nodelist_str;
@@ -194,13 +222,26 @@ struct PartitionMeta {
 };
 
 struct InteractiveMetaInTask {
-  std::function<void(task_id_t, std::string const&)> cb_task_res_allocated;
+  std::string cfored_name;
+  crane::grpc::InteractiveTaskType interactive_type;
+
+  std::string sh_script;
+  std::string term_env;
+  std::function<void(task_id_t, std::string const&,
+                     std::list<std::string> const&)>
+      cb_task_res_allocated;
   std::function<void(task_id_t)> cb_task_completed;
+
+  // only for calloc.
   std::function<void(task_id_t)> cb_task_cancel;
 
-  // ccancel for an interactive task should call the front end to kill the
-  // user's shell, let Cfored to inform CraneCtld of task completion rather than
-  // directly sending TerminateTask to its craned node.
+  // only for crun.
+  size_t status_change_cnt{0};
+
+  // ccancel for an interactive CALLOC task should call the front end to kill
+  // the user's shell, let Cfored to inform CraneCtld of task completion rather
+  // than directly sending TerminateTask to its craned node.
+  //
   // However, when TIMEOUT event on its craned node happens, Cranectld should
   // also send TaskCancelRequest to the front end. So we need a flag
   // ` has_been_cancelled_on_front_end` to record whether the front end for the
@@ -231,7 +272,9 @@ struct TaskInCtld {
   absl::Duration time_limit;
 
   PartitionId partition_id;
-  Resources resources;
+
+  // Set by user request and probably include untyped devices.
+  ResourceView requested_node_res_view;
 
   crane::grpc::TaskType type;
 
@@ -254,6 +297,8 @@ struct TaskInCtld {
   std::unordered_map<std::string, std::string> env;
   std::string cwd;
 
+  std::string extra_attr;
+
   std::variant<InteractiveMetaInTask, BatchMetaInTask> meta;
 
  private:
@@ -274,6 +319,7 @@ struct TaskInCtld {
   std::list<CranedId> craned_ids;
   crane::grpc::TaskStatus status;
   uint32_t exit_code;
+  bool held{false};
 
   // If this task is PENDING, start_time is either not set (default constructed)
   // or an estimated start time.
@@ -281,6 +327,9 @@ struct TaskInCtld {
   absl::Time submit_time;
   absl::Time start_time;
   absl::Time end_time;
+
+  // Might change at each scheduling cycle.
+  ResourceV2 resources;
 
   /* ------ duplicate of the fields [1] above just for convenience ----- */
   crane::grpc::TaskToCtld task_to_ctld;
@@ -292,11 +341,11 @@ struct TaskInCtld {
   /* -----------
    * Fields that will not change at run time.
    * However, these fields are NOT persisted on the disk.
+   * These fields are cached for performance purpose.
    * ----------- */
   // set in SetFieldsByTaskToCtld from uid
   std::unique_ptr<PasswordEntry> password_entry;
 
-  // Cached fields for performance.
   // Set in TaskScheduler->AcquireAttributes()
   uint32_t partition_priority{0};
   uint32_t qos_priority{0};
@@ -305,12 +354,18 @@ struct TaskInCtld {
    * Fields that may change at run time.
    * However, these fields are NOT persisted on the disk.
    * ----------- */
-  uint32_t nodes_alloc;
-  CranedId executing_craned_id;  // The root process of the task started on this
-                                 // node id.
-  std::string allocated_craneds_regex;
 
-  double schedule_priority{0.0};
+  // Aggregated from resources of all nodes.
+  // Might change at each scheduling cycle.
+  ResourceView allocated_res_view;
+
+  uint32_t nodes_alloc;
+  std::vector<CranedId> executing_craned_ids;
+  std::string allocated_craneds_regex;
+  std::string pending_reason;
+
+  double mandated_priority{0.0};
+  double cached_priority{0.0};
 
   // Helper function
  public:
@@ -403,12 +458,26 @@ struct TaskInCtld {
   absl::Time const& EndTime() const { return end_time; }
   int64_t EndTimeInUnixSecond() const { return ToUnixSeconds(end_time); }
 
+  void SetHeld(bool val) {
+    held = val;
+    runtime_attr.set_held(val);
+  }
+  bool const& Held() const { return held; }
+
+  void SetResources(ResourceV2&& val) {
+    *runtime_attr.mutable_resources() =
+        static_cast<crane::grpc::ResourceV2>(val);
+    resources = std::move(val);
+  }
+  ResourceV2 const& Resources() const { return resources; }
+
   void SetFieldsByTaskToCtld(crane::grpc::TaskToCtld const& val) {
     task_to_ctld = val;
 
     partition_id = (val.partition_name().empty()) ? g_config.DefaultPartition
                                                   : val.partition_name();
-    resources.allocatable_resource = val.resources().allocatable_resource();
+    requested_node_res_view = static_cast<ResourceView>(val.resources());
+
     time_limit = absl::Seconds(val.time_limit().seconds());
 
     type = val.type();
@@ -419,6 +488,15 @@ struct TaskInCtld {
           .output_file_pattern = val.batch_meta().output_file_pattern(),
           .error_file_pattern = val.batch_meta().error_file_pattern(),
       });
+    } else {
+      auto& InteractiveMeta = std::get<InteractiveMetaInTask>(meta);
+      InteractiveMeta.cfored_name = val.interactive_meta().cfored_name();
+      InteractiveMeta.sh_script = val.interactive_meta().sh_script();
+      InteractiveMeta.interactive_type =
+          val.interactive_meta().interactive_type();
+      if (InteractiveMeta.interactive_type ==
+          crane::grpc::InteractiveTaskType::Crun)
+        InteractiveMeta.term_env = val.interactive_meta().term_env();
     }
 
     node_num = val.node_num();
@@ -438,6 +516,8 @@ struct TaskInCtld {
     qos = val.qos();
 
     get_user_env = val.get_user_env();
+
+    extra_attr = val.extra_attr();
   }
 
   void SetFieldsByRuntimeAttr(crane::grpc::RuntimeAttrOfTask const& val) {
@@ -449,49 +529,84 @@ struct TaskInCtld {
     username = runtime_attr.username();
 
     nodes_alloc = craned_ids.size();
+    exit_code = runtime_attr.exit_code();
 
     status = runtime_attr.status();
+    held = runtime_attr.held();
 
     if (status != crane::grpc::TaskStatus::Pending) {
       craned_ids.assign(runtime_attr.craned_ids().begin(),
                         runtime_attr.craned_ids().end());
-      executing_craned_id = craned_ids.front();
+      allocated_craneds_regex = util::HostNameListToStr(craned_ids);
+
+      if (type == crane::grpc::Batch)
+        executing_craned_ids.emplace_back(craned_ids.front());
+      else {
+        const auto& int_meta = std::get<InteractiveMetaInTask>(meta);
+        if (int_meta.interactive_type == crane::grpc::Calloc)
+          // For calloc tasks we still need to execute a dummy empty task to
+          // set up a timer.
+          executing_craned_ids.emplace_back(CranedIds().front());
+        else
+          // For crun tasks we need to execute tasks on all allocated nodes.
+          for (auto const& craned_id : craned_ids)
+            executing_craned_ids.emplace_back(craned_id);
+      }
+
+      resources = static_cast<ResourceV2>(runtime_attr.resources());
     }
 
     start_time = absl::FromUnixSeconds(runtime_attr.start_time().seconds());
     end_time = absl::FromUnixSeconds(runtime_attr.end_time().seconds());
   }
-};
 
-struct TaskInDb {
-  crane::grpc::TaskType type;
-  task_id_t task_id;
-  std::string name;
-  PartitionId partition_id;
-  uid_t uid;
+  // Helper function to set the fields of TaskInfo using info in
+  // TaskInCtld. Note that mutable_elapsed_time() is not set here for
+  // performance reason. The caller should set it manually.
+  void SetFieldsOfTaskInfo(crane::grpc::TaskInfo* task_info) {
+    task_info->set_type(type);
+    task_info->set_task_id(task_id);
+    task_info->set_name(name);
 
-  gid_t gid;
-  absl::Duration time_limit;
-  google::protobuf::Timestamp submit_time;
-  google::protobuf::Timestamp start_time;
-  google::protobuf::Timestamp end_time;
-  std::string account;
+    task_info->set_account(account);
+    task_info->set_partition(partition_id);
+    task_info->set_qos(qos);
 
-  uint32_t node_num{0};
-  std::string cmd_line;
-  std::string cwd;
-  std::string username;
-  std::string qos;
+    task_info->mutable_time_limit()->set_seconds(ToInt64Seconds(time_limit));
+    task_info->mutable_submit_time()->CopyFrom(runtime_attr.submit_time());
+    task_info->mutable_start_time()->CopyFrom(runtime_attr.start_time());
+    task_info->mutable_end_time()->CopyFrom(runtime_attr.end_time());
 
-  Resources resources;
-  uint32_t exit_code;
-  crane::grpc::TaskStatus status;
-  std::string allocated_craneds_regex;
+    task_info->set_uid(uid);
+    task_info->set_gid(gid);
+    task_info->set_username(username);
+    task_info->set_node_num(node_num);
+    task_info->set_cmd_line(cmd_line);
+    task_info->set_cwd(cwd);
+    task_info->mutable_req_nodes()->Assign(included_nodes.begin(),
+                                           included_nodes.end());
+    task_info->mutable_exclude_nodes()->Assign(excluded_nodes.begin(),
+                                               excluded_nodes.end());
 
-  void SetSubmitTimeByUnixSecond(uint64_t val) { submit_time.set_seconds(val); }
-  void SetStartTimeByUnixSecond(uint64_t val) { start_time.set_seconds(val); }
+    task_info->set_extra_attr(extra_attr);
 
-  void SetEndTimeByUnixSecond(uint64_t val) { end_time.set_seconds(val); }
+    task_info->set_held(held);
+    task_info->mutable_execution_node()->Assign(executing_craned_ids.begin(),
+                                                executing_craned_ids.end());
+
+    *task_info->mutable_res_view() =
+        static_cast<crane::grpc::ResourceView>(requested_node_res_view);
+
+    task_info->set_exit_code(runtime_attr.exit_code());
+    task_info->set_priority(cached_priority);
+
+    task_info->set_status(status);
+    if (Status() == crane::grpc::Pending) {
+      task_info->set_pending_reason(pending_reason);
+    } else {
+      task_info->set_craned_list(allocated_craneds_regex);
+    }
+  }
 };
 
 struct Qos {
@@ -505,6 +620,28 @@ struct Qos {
   absl::Duration max_time_limit_per_task;
   uint32_t max_cpus_per_user;
   uint32_t max_cpus_per_account;
+
+  static constexpr const char* FieldStringOfDeleted() { return "deleted"; }
+  static constexpr const char* FieldStringOfName() { return "name"; }
+  static constexpr const char* FieldStringOfDescription() {
+    return "description";
+  }
+  static constexpr const char* FieldStringOfReferenceCount() {
+    return "reference_count";
+  }
+  static constexpr const char* FieldStringOfPriority() { return "priority"; }
+  static constexpr const char* FieldStringOfMaxJobsPerUser() {
+    return "max_jobs_per_user";
+  }
+  static constexpr const char* FieldStringOfMaxTimeLimitPerTask() {
+    return "max_time_limit_per_task";
+  }
+  static constexpr const char* FieldStringOfMaxCpusPerUser() {
+    return "max_cpus_per_user";
+  }
+  static constexpr const char* FieldStringOfMaxCpusPerAccount() {
+    return "max_cpus_per_account";
+  }
 };
 
 struct Account {
@@ -522,7 +659,18 @@ struct Account {
 };
 
 struct User {
-  enum AdminLevel { None, Operator, Admin };
+  // Root corresponds to root user in Linux System and have any permission over
+  // the whole system.
+  // Admin and Operator are created for just compatability of existing systems
+  // like Slurm.
+  // Root, Admin and Operator actually have no difference when controlling Crane
+  // system in the current stage.
+  // However, Crane system follows the rule that the users with the same admin
+  // level can't control each other, but users with higher level can control
+  // users with lower level. Thus, Root level is created for the integrity of
+  // Crane system to guarantee that there will always a superuser to control all
+  // the administrator of the whole system.
+  enum AdminLevel { None, Operator, Admin, Root };
 
   using PartToAllowedQosMap = std::unordered_map<
       std::string /*partition name*/,
@@ -545,6 +693,15 @@ struct User {
   std::list<std::string> coordinator_accounts;
   AdminLevel admin_level;
 };
+
+inline bool CheckIfTimeLimitSecIsValid(int64_t sec) {
+  return sec >= kTaskMinTimeLimitSec && sec <= kTaskMaxTimeLimitSec;
+}
+
+inline bool CheckIfTimeLimitIsValid(absl::Duration d) {
+  int64_t sec = ToInt64Seconds(d);
+  return CheckIfTimeLimitSecIsValid(sec);
+}
 
 }  // namespace Ctld
 

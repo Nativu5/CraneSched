@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CranedKeeper.h"
@@ -110,7 +112,7 @@ CraneErr CranedStub::TerminateOrphanedTask(task_id_t task_id) {
 }
 
 CraneErr CranedStub::CreateCgroupForTasks(
-    std::vector<std::pair<task_id_t, uid_t>> const &task_uid_pairs) {
+    std::vector<CgroupSpec> const &cgroup_specs) {
   using crane::grpc::CreateCgroupForTasksReply;
   using crane::grpc::CreateCgroupForTasksRequest;
 
@@ -122,9 +124,11 @@ CraneErr CranedStub::CreateCgroupForTasks(
   context.set_deadline(std::chrono::system_clock::now() +
                        std::chrono::seconds(kCtldRpcTimeoutSeconds));
 
-  for (auto &&[task_id, uid] : task_uid_pairs) {
-    request.mutable_task_id_list()->Add(task_id);
-    request.mutable_uid_list()->Add(uid);
+  for (const CgroupSpec &spec : cgroup_specs) {
+    request.mutable_task_id_list()->Add(spec.task_id);
+    request.mutable_uid_list()->Add(spec.uid);
+    *request.mutable_res_list()->Add() = std::move(spec.res_in_node);
+    request.add_execution_node(spec.execution_node);
   }
 
   status = m_stub_->CreateCgroupForTasks(&context, request, &reply);
@@ -212,15 +216,49 @@ CraneErr CranedStub::ChangeTaskTimeLimit(uint32_t task_id, uint64_t seconds) {
                 m_craned_id_, grpc_status.error_message());
     return CraneErr::kRpcFailure;
   }
-
   if (reply.ok())
     return CraneErr::kOk;
   else
     return CraneErr::kGenericFailure;
 }
 
-crane::grpc::ExecuteTasksRequest CranedStub::NewExecuteTasksRequest(
-    const std::vector<TaskInCtld *> &tasks) {
+CraneErr CranedStub::QueryCranedRemoteMeta(CranedRemoteMeta *meta) {
+  using crane::grpc::QueryCranedRemoteMetaReply;
+  using crane::grpc::QueryCranedRemoteMetaRequest;
+  ClientContext context;
+  Status grpc_status;
+
+  QueryCranedRemoteMetaRequest request;
+  QueryCranedRemoteMetaReply reply;
+
+  grpc_status = m_stub_->QueryCranedRemoteMeta(&context, request, &reply);
+  if (!grpc_status.ok()) {
+    CRANE_ERROR("QueryCranedMeta to Craned {} failed: {} ", m_craned_id_,
+                grpc_status.error_message());
+    return CraneErr::kRpcFailure;
+  }
+
+  const auto *grpc_meta = reply.mutable_craned_remote_meta();
+  meta->dres_in_node =
+      static_cast<DedicatedResourceInNode>(grpc_meta->dres_in_node());
+
+  meta->craned_version = grpc_meta->craned_version();
+  meta->sys_rel_info.name = grpc_meta->sys_rel_info().name();
+  meta->sys_rel_info.release = grpc_meta->sys_rel_info().release();
+  meta->sys_rel_info.version = grpc_meta->sys_rel_info().version();
+
+  meta->craned_start_time =
+      absl::FromUnixSeconds(grpc_meta->craned_start_time().seconds());
+  meta->system_boot_time =
+      absl::FromUnixSeconds(grpc_meta->system_boot_time().seconds());
+
+  if (reply.ok()) return CraneErr::kOk;
+
+  return CraneErr::kGenericFailure;
+}
+
+crane::grpc::ExecuteTasksRequest CranedStub::NewExecuteTasksRequests(
+    const CranedId &craned_id, const std::vector<TaskInCtld *> &tasks) {
   crane::grpc::ExecuteTasksRequest request;
 
   for (TaskInCtld *task : tasks) {
@@ -232,14 +270,9 @@ crane::grpc::ExecuteTasksRequest CranedStub::NewExecuteTasksRequest(
             ToInt64Milliseconds(task->time_limit)));
 
     // Set resources
-    auto *mutable_allocatable_resource =
-        mutable_task->mutable_resources()->mutable_allocatable_resource();
-    mutable_allocatable_resource->set_cpu_core_limit(
-        static_cast<double>(task->resources.allocatable_resource.cpu_count));
-    mutable_allocatable_resource->set_memory_limit_bytes(
-        task->resources.allocatable_resource.memory_bytes);
-    mutable_allocatable_resource->set_memory_sw_limit_bytes(
-        task->resources.allocatable_resource.memory_sw_bytes);
+    auto *mutable_res_in_node = mutable_task->mutable_resources();
+    *mutable_res_in_node = static_cast<crane::grpc::ResourceInNode>(
+        task->Resources().at(craned_id));
 
     // Set type
     mutable_task->set_type(task->type);
@@ -281,6 +314,13 @@ crane::grpc::ExecuteTasksRequest CranedStub::NewExecuteTasksRequest(
       mutable_meta->set_output_file_pattern(meta_in_ctld.output_file_pattern);
       mutable_meta->set_error_file_pattern(meta_in_ctld.error_file_pattern);
       mutable_meta->set_sh_script(meta_in_ctld.sh_script);
+    } else {
+      auto &meta_in_ctld = std::get<InteractiveMetaInTask>(task->meta);
+      auto *mutable_meta = mutable_task->mutable_interactive_meta();
+      mutable_meta->set_cfored_name(meta_in_ctld.cfored_name);
+      mutable_meta->set_sh_script(meta_in_ctld.sh_script);
+      mutable_meta->set_term_env(meta_in_ctld.term_env);
+      mutable_meta->set_interactive_type(meta_in_ctld.interactive_type);
     }
   }
 
@@ -379,12 +419,12 @@ void CranedKeeper::StateMonitorThreadFunc_(int thread_id) {
       grpc_connectivity_state new_state = craned->m_channel_->GetState(true);
 
       switch (tag->type) {
-        case CqTag::kInitializingCraned:
-          next_tag = InitCranedStateMachine_(craned, new_state);
-          break;
-        case CqTag::kEstablishedCraned:
-          next_tag = EstablishedCranedStateMachine_(craned, new_state);
-          break;
+      case CqTag::kInitializingCraned:
+        next_tag = InitCranedStateMachine_(craned, new_state);
+        break;
+      case CqTag::kEstablishedCraned:
+        next_tag = EstablishedCranedStateMachine_(craned, new_state);
+        break;
       }
 
       if (next_tag) {
@@ -451,73 +491,73 @@ CranedKeeper::CqTag *CranedKeeper::InitCranedStateMachine_(
   std::optional<CqTag::Type> next_tag_type;
 
   switch (new_state) {
-    case GRPC_CHANNEL_READY: {
-      {
-        CRANE_TRACE("CONNECTING -> READY. New craned {} connected.",
-                    craned->m_craned_id_);
+  case GRPC_CHANNEL_READY: {
+    {
+      CRANE_TRACE("CONNECTING -> READY. New craned {} connected.",
+                  craned->m_craned_id_);
 
-        WriterLock lock(&m_connected_craned_mtx_);
-        m_connected_craned_id_stub_map_.emplace(craned->m_craned_id_, craned);
-        craned->m_invalid_ = false;
-      }
-      {
-        util::lock_guard guard(m_unavail_craned_set_mtx_);
-        m_unavail_craned_set_.erase(craned->m_craned_id_);
-        m_connecting_craned_set_.erase(craned->m_craned_id_);
-      }
-
-      if (m_craned_is_up_cb_)
-        g_thread_pool->detach_task([this, craned_id = craned->m_craned_id_]() {
-          m_craned_is_up_cb_(craned_id);
-        });
-
-      // Switch to EstablishedCraned state machine
-      next_tag_type = CqTag::kEstablishedCraned;
-      break;
+      WriterLock lock(&m_connected_craned_mtx_);
+      m_connected_craned_id_stub_map_.emplace(craned->m_craned_id_, craned);
+      craned->m_invalid_ = false;
+    }
+    {
+      util::lock_guard guard(m_unavail_craned_set_mtx_);
+      m_unavail_craned_set_.erase(craned->m_craned_id_);
+      m_connecting_craned_set_.erase(craned->m_craned_id_);
     }
 
-    case GRPC_CHANNEL_TRANSIENT_FAILURE: {
-      // current              next
-      // TRANSIENT_FAILURE -> CONNECTING/END
+    if (m_craned_is_up_cb_)
+      g_thread_pool->detach_task([this, craned_id = craned->m_craned_id_]() {
+        m_craned_is_up_cb_(craned_id);
+      });
 
-      if (++craned->m_failure_retry_times_ <= craned->s_maximum_retry_times_)
-        next_tag_type = CqTag::kInitializingCraned;
-      else
-        next_tag_type = std::nullopt;
+    // Switch to EstablishedCraned state machine
+    next_tag_type = CqTag::kEstablishedCraned;
+    break;
+  }
 
-      CRANE_TRACE("{} -> TRANSIENT_FAILURE({}/{}) -> CONNECTING/END",
-                  craned->m_prev_channel_state_, craned->m_failure_retry_times_,
-                  craned->s_maximum_retry_times_);
-      break;
-    }
+  case GRPC_CHANNEL_TRANSIENT_FAILURE: {
+    // current              next
+    // TRANSIENT_FAILURE -> CONNECTING/END
 
-    case GRPC_CHANNEL_SHUTDOWN: {
-      CRANE_WARN("Unexpected InitializingCraned SHUTDOWN state!");
+    if (++craned->m_failure_retry_times_ <= craned->s_maximum_retry_times_)
+      next_tag_type = CqTag::kInitializingCraned;
+    else
       next_tag_type = std::nullopt;
-      break;
-    }
 
-    case GRPC_CHANNEL_CONNECTING: {
-      if (craned->m_prev_channel_state_ == GRPC_CHANNEL_IDLE) {
-        // prev    now
-        // IDLE -> CONNECTING
-        // CRANE_TRACE("IDLE -> CONNECTING");
-        next_tag_type = CqTag::kInitializingCraned;
-      } else {
-        // prev    current       next
-        // Any  -> CONNECTING -> CONNECTING
-        CRANE_TRACE("{} -> CONNECTING -> CONNECTING",
-                    craned->m_prev_channel_state_);
-        next_tag_type = CqTag::kInitializingCraned;
-      }
-      break;
-    }
+    CRANE_TRACE("{} -> TRANSIENT_FAILURE({}/{}) -> CONNECTING/END",
+                craned->m_prev_channel_state_, craned->m_failure_retry_times_,
+                craned->s_maximum_retry_times_);
+    break;
+  }
 
-    case GRPC_CHANNEL_IDLE:
-      // InitializingCraned: BEGIN -> IDLE state switching is handled in
-      // CranedKeeper::RegisterNewCraneds. Execution should never reach here.
-      CRANE_ERROR("Unexpected InitializingCraned IDLE state!");
-      break;
+  case GRPC_CHANNEL_SHUTDOWN: {
+    CRANE_WARN("Unexpected InitializingCraned SHUTDOWN state!");
+    next_tag_type = std::nullopt;
+    break;
+  }
+
+  case GRPC_CHANNEL_CONNECTING: {
+    if (craned->m_prev_channel_state_ == GRPC_CHANNEL_IDLE) {
+      // prev    now
+      // IDLE -> CONNECTING
+      // CRANE_TRACE("IDLE -> CONNECTING");
+      next_tag_type = CqTag::kInitializingCraned;
+    } else {
+      // prev    current       next
+      // Any  -> CONNECTING -> CONNECTING
+      CRANE_TRACE("{} -> CONNECTING -> CONNECTING",
+                  craned->m_prev_channel_state_);
+      next_tag_type = CqTag::kInitializingCraned;
+    }
+    break;
+  }
+
+  case GRPC_CHANNEL_IDLE:
+    // InitializingCraned: BEGIN -> IDLE state switching is handled in
+    // CranedKeeper::RegisterNewCraneds. Execution should never reach here.
+    CRANE_ERROR("Unexpected InitializingCraned IDLE state!");
+    break;
   }
 
   // CRANE_TRACE("Exit InitCranedStateMachine_");
@@ -536,50 +576,51 @@ CranedKeeper::CqTag *CranedKeeper::EstablishedCranedStateMachine_(
   std::optional<CqTag::Type> next_tag_type;
 
   switch (new_state) {
-    case GRPC_CHANNEL_CONNECTING: {
-      if (craned->m_prev_channel_state_ == GRPC_CHANNEL_CONNECTING) {
-        // prev          current       next
-        // CONNECTING -> CONNECTING -> END
-        CRANE_TRACE("CONNECTING -> CONNECTING -> END");
-        next_tag_type = std::nullopt;
-      } else {
-        // prev    now
-        // IDLE -> CONNECTING
-        CRANE_TRACE("IDLE -> CONNECTING");
-        next_tag_type = CqTag::kEstablishedCraned;
-      }
-      break;
-    }
-
-    case GRPC_CHANNEL_IDLE: {
-      // prev     current
-      // READY -> IDLE (the only edge)
-
-      craned->m_invalid_ = true;
-
-      next_tag_type = CqTag::kEstablishedCraned;
-      break;
-    }
-
-    case GRPC_CHANNEL_READY: {
-      // Any -> READY
-      next_tag_type = CqTag::kEstablishedCraned;
-      break;
-    }
-
-    case GRPC_CHANNEL_TRANSIENT_FAILURE: {
-      // current              next
-      // TRANSIENT_FAILURE -> END
+  case GRPC_CHANNEL_CONNECTING: {
+    if (craned->m_prev_channel_state_ == GRPC_CHANNEL_CONNECTING) {
+      // prev          current       next
+      // CONNECTING -> CONNECTING -> END
+      CRANE_TRACE("CONNECTING -> CONNECTING -> END");
       next_tag_type = std::nullopt;
-      break;
+    } else {
+      // prev    now
+      // IDLE -> CONNECTING
+      CRANE_TRACE("IDLE -> CONNECTING");
+      next_tag_type = CqTag::kEstablishedCraned;
     }
+    break;
+  }
 
-    case GRPC_CHANNEL_SHUTDOWN: {
-      craned->m_invalid_ = true;
+  case GRPC_CHANNEL_IDLE: {
+    // prev     current
+    // READY -> IDLE (the only edge)
 
-      next_tag_type = std::nullopt;
-      break;
-    }
+    // CRANE_TRACE("READY -> IDLE");
+    craned->m_invalid_ = true;
+
+    next_tag_type = CqTag::kEstablishedCraned;
+    break;
+  }
+
+  case GRPC_CHANNEL_READY: {
+    // Any -> READY
+    next_tag_type = CqTag::kEstablishedCraned;
+    break;
+  }
+
+  case GRPC_CHANNEL_TRANSIENT_FAILURE: {
+    // current              next
+    // TRANSIENT_FAILURE -> END
+    next_tag_type = std::nullopt;
+    break;
+  }
+
+  case GRPC_CHANNEL_SHUTDOWN: {
+    craned->m_invalid_ = true;
+
+    next_tag_type = std::nullopt;
+    break;
+  }
   }
 
   if (next_tag_type.has_value()) {
@@ -601,10 +642,9 @@ std::shared_ptr<CranedStub> CranedKeeper::GetCranedStub(
     const CranedId &craned_id) {
   ReaderLock lock(&m_connected_craned_mtx_);
   auto iter = m_connected_craned_id_stub_map_.find(craned_id);
-  if (iter != m_connected_craned_id_stub_map_.end())
-    return iter->second;
-  else
-    return nullptr;
+  if (iter != m_connected_craned_id_stub_map_.end()) return iter->second;
+
+  return nullptr;
 }
 
 void CranedKeeper::SetCranedIsUpCb(std::function<void(CranedId)> cb) {
@@ -623,9 +663,34 @@ void CranedKeeper::PutNodeIntoUnavailList(const std::string &crane_id) {
 }
 
 void CranedKeeper::ConnectCranedNode_(CranedId const &craned_id) {
+  static std::unordered_map<CranedId, std::variant<ipv4_t, ipv6_t>>
+      s_craned_id_to_ip_cache_map;
+
   std::string ip_addr;
-  if (!crane::ResolveIpv4FromHostname(craned_id, &ip_addr)) {
-    ip_addr = craned_id;
+
+  auto it = s_craned_id_to_ip_cache_map.find(craned_id);
+  if (it != s_craned_id_to_ip_cache_map.end()) {
+    if (std::holds_alternative<ipv4_t>(it->second)) {  // Ipv4
+      ip_addr = crane::Ipv4ToStr(std::get<ipv4_t>(it->second));
+    } else {
+      CRANE_ASSERT(std::holds_alternative<ipv6_t>(it->second));
+      ip_addr = crane::Ipv6ToStr(std::get<ipv6_t>(it->second));
+    }
+  } else {
+    ipv4_t ipv4_addr;
+    ipv6_t ipv6_addr;
+    if (crane::ResolveIpv4FromHostname(craned_id, &ipv4_addr)) {
+      ip_addr = crane::Ipv4ToStr(ipv4_addr);
+      s_craned_id_to_ip_cache_map.emplace(craned_id, ipv4_addr);
+    } else if (crane::ResolveIpv6FromHostname(craned_id, &ipv6_addr)) {
+      ip_addr = crane::Ipv6ToStr(ipv6_addr);
+      s_craned_id_to_ip_cache_map.emplace(craned_id, ipv6_addr);
+    } else {
+      // Just hostname. It should never happen,
+      // but we add error handling here for robustness.
+      CRANE_ERROR("Unresolved hostname: {}", craned_id);
+      ip_addr = craned_id;
+    }
   }
 
   auto *craned = new CranedStub(this);
@@ -638,50 +703,21 @@ void CranedKeeper::ConnectCranedNode_(CranedId const &craned_id) {
    * https://grpc.github.io/grpc/cpp/md_doc_connection-backoff.html
    */
   grpc::ChannelArguments channel_args;
+  SetGrpcClientKeepAliveChannelArgs(&channel_args);
 
   if (g_config.CompressedRpc)
     channel_args.SetCompressionAlgorithm(GRPC_COMPRESS_GZIP);
 
-  channel_args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 1000 /*ms*/);
-  channel_args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 2 /*s*/ * 1000
-                      /*ms*/);
-  channel_args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS,
-                      30 /*s*/ * 1000 /*ms*/);
+  CRANE_TRACE("Creating a channel to {} {}:{}. Channel count: {}", craned_id,
+              ip_addr, kCranedDefaultPort, m_channel_count_.fetch_add(1) + 1);
 
-  // Sometimes, Craned might crash without cleaning up sockets and
-  // the socket will remain ESTABLISHED state even if that craned has died.
-  // Open KeepAlive option in case of such situation.
-  // See https://grpc.github.io/grpc/cpp/md_doc_keepalive.html
-  channel_args.SetInt(
-      GRPC_ARG_KEEPALIVE_TIME_MS,
-      kCraneCtldGrpcClientPingSendIntervalSec /*s*/ * 1000 /*ms*/);
-  channel_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10 /*s*/ * 1000 /*ms*/);
-  channel_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1 /*true*/);
-  channel_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0 /*no limit*/);
-
-  CRANE_TRACE("Creating a channel to {}:{}. Channel count: {}", craned_id,
-              kCranedDefaultPort, m_channel_count_.fetch_add(1) + 1);
-
-  std::string addr_port = fmt::format("{}:{}", ip_addr, kCranedDefaultPort);
   if (g_config.ListenConf.UseTls) {
-    channel_args.SetSslTargetNameOverride(
-        fmt::format("{}.{}", craned_id, g_config.ListenConf.DomainSuffix));
-
-    grpc::SslCredentialsOptions ssl_opts;
-    // pem_root_certs is actually the certificate of server side rather than
-    // CA certificate. CA certificate is not needed.
-    // Since we use the same cert/key pair for both cranectld/craned,
-    // pem_root_certs is set to the same certificate.
-    ssl_opts.pem_root_certs = g_config.ListenConf.ServerCertContent;
-    ssl_opts.pem_cert_chain = g_config.ListenConf.ServerCertContent;
-    ssl_opts.pem_private_key = g_config.ListenConf.ServerKeyContent;
-
-    craned->m_channel_ = grpc::CreateCustomChannel(
-        addr_port, grpc::SslCredentials(ssl_opts), channel_args);
-  } else {
-    craned->m_channel_ = grpc::CreateCustomChannel(
-        addr_port, grpc::InsecureChannelCredentials(), channel_args);
-  }
+    SetTlsHostnameOverride(&channel_args, craned_id, g_config.ListenConf.Certs);
+    craned->m_channel_ = CreateTcpTlsCustomChannelByIp(
+        ip_addr, kCranedDefaultPort, g_config.ListenConf.Certs, channel_args);
+  } else
+    craned->m_channel_ = CreateTcpInsecureCustomChannel(
+        ip_addr, kCranedDefaultPort, channel_args);
 
   craned->m_prev_channel_state_ = craned->m_channel_->GetState(true);
   craned->m_stub_ = crane::grpc::Craned::NewStub(craned->m_channel_);

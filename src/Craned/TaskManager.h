@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -26,13 +28,10 @@
 #include <grp.h>
 #include <sys/eventfd.h>
 #include <sys/wait.h>
-#include <uv.h>
 
-#include <memory>
-#include <uvw.hpp>
-
+#include "CgroupManager.h"
 #include "CtldClient.h"
-#include "crane/AtomicHashMap.h"
+#include "DeviceManager.h"
 #include "crane/PasswordEntry.h"
 #include "crane/PublicHeader.h"
 #include "protos/Crane.grpc.pb.h"
@@ -141,8 +140,28 @@ class ProcessInstance {
   std::function<void(void*)> m_clean_cb_;
 };
 
-struct BatchMetaInTaskInstance {
+struct MetaInTaskInstance {
   std::string parsed_sh_script_path;
+  virtual ~MetaInTaskInstance() = default;
+};
+
+struct BatchMetaInTaskInstance : MetaInTaskInstance {
+  ~BatchMetaInTaskInstance() override = default;
+};
+
+struct CrunMetaInTaskInstance : MetaInTaskInstance {
+  int proc_in_fd;
+  int proc_out_fd;
+  ~CrunMetaInTaskInstance() override = default;
+};
+
+// also arg for EvDoSigChldCb_
+struct ProcSigchldInfo {
+  pid_t pid;
+  bool is_terminated_by_signal;
+  int value;
+
+  event* resend_timer{nullptr};
 };
 
 // Todo: Task may consists of multiple subtasks
@@ -155,21 +174,31 @@ struct TaskInstance {
       event_free(termination_timer);
       termination_timer = nullptr;
     }
+
+    if (this->IsCrun()) {
+      close(dynamic_cast<CrunMetaInTaskInstance*>(meta.get())->proc_in_fd);
+    }
   }
+
+  bool IsCrun() const;
+  bool IsCalloc() const;
+  std::vector<EnvPair> GetTaskEnvList() const;
 
   crane::grpc::TaskToD task;
 
   PasswordEntry pwd_entry;
-  BatchMetaInTaskInstance batch_meta;
-
-  bool cancelled_by_user{false};
-  bool terminated_by_timeout{false};
-
-  bool orphaned{false};
+  std::unique_ptr<MetaInTaskInstance> meta;
 
   std::string cgroup_path;
-  util::Cgroup* cgroup;
+  Cgroup* cgroup;
   struct event* termination_timer{nullptr};
+
+  // Task execution results
+  bool orphaned{false};
+  CraneErr err_before_exec{CraneErr::kOk};
+  bool cancelled_by_user{false};
+  bool terminated_by_timeout{false};
+  ProcSigchldInfo sigchld_info{};
 
   absl::flat_hash_map<pid_t, std::unique_ptr<ProcessInstance>> processes;
 };
@@ -188,22 +217,10 @@ class TaskManager {
 
   CraneErr ExecuteTaskAsync(crane::grpc::TaskToD const& task);
 
-  [[deprecated]] CraneErr SpawnInteractiveTaskAsync(
-      uint32_t task_id, std::string executive_path,
-      std::list<std::string> arguments,
-      std::function<void(std::string&&, void*)> output_cb,
-      std::function<void(bool, int, void*)> finish_cb);
-
   std::optional<uint32_t> QueryTaskIdFromPidAsync(pid_t pid);
 
-  bool QueryTaskInfoOfUidAsync(uid_t uid, TaskInfoOfUid* info);
-
-  bool CreateCgroupsAsync(
-      std::vector<std::pair<task_id_t, uid_t>>&& task_id_uid_pairs);
-
-  bool MigrateProcToCgroupOfTask(pid_t pid, task_id_t task_id);
-
-  bool ReleaseCgroupAsync(uint32_t task_id, uid_t uid);
+  std::optional<std::vector<std::pair<std::string, std::string>>>
+  QueryTaskEnvironmentVariablesAsync(task_id_t task_id);
 
   void TerminateTaskAsync(uint32_t task_id);
 
@@ -212,6 +229,8 @@ class TaskManager {
   bool CheckTaskStatusAsync(task_id_t task_id, crane::grpc::TaskStatus* status);
 
   bool ChangeTaskTimeLimitAsync(task_id_t task_id, absl::Duration time_limit);
+
+  void TaskStopAndDoStatusChangeAsync(uint32_t task_id);
 
   // Wait internal libevent base loop to exit...
   void Wait();
@@ -227,29 +246,21 @@ class TaskManager {
   template <class T>
   using ConcurrentQueue = moodycamel::ConcurrentQueue<T>;
 
-  struct SigchldInfo {
-    pid_t pid;
-    bool is_terminated_by_signal;
-    int value;
-  };
-
-  struct savedPrivilege {
+  struct SavedPrivilege {
     uid_t uid;
     gid_t gid;
-  };
-
-  struct EvQueueGrpcInteractiveTask {
-    std::promise<CraneErr> err_promise;
-    uint32_t task_id;
-    std::string executive_path;
-    std::list<std::string> arguments;
-    std::function<void(std::string&&, void*)> output_cb;
-    std::function<void(bool, int, void*)> finish_cb;
   };
 
   struct EvQueueQueryTaskIdFromPid {
     std::promise<std::optional<uint32_t> /*task_id*/> task_id_prom;
     pid_t pid;
+  };
+
+  struct EvQueueQueryTaskEnvironmentVariables {
+    std::promise<
+        std::optional<std::vector<std::pair<std::string, std::string>>>>
+        env_prom;
+    task_id_t task_id;
   };
 
   struct EvQueueChangeTaskTimeLimit {
@@ -272,25 +283,19 @@ class TaskManager {
     std::promise<std::pair<bool, crane::grpc::TaskStatus>> status_prom;
   };
 
-  static std::string CgroupStrByTaskId_(task_id_t task_id);
+  struct EvQueueSigchldArg {
+    TaskManager* task_manager;
+    std::unique_ptr<ProcSigchldInfo> sigchld_info;
+  };
 
   static std::string ParseFilePathPattern_(const std::string& path_pattern,
                                            const std::string& cwd,
                                            task_id_t task_id);
 
-  /**
-   * EvActivateTaskStatusChange_ must NOT be called in this method and should be
-   *  called in the caller method after checking the return value of this
-   *  method.
-   * @return kSystemErr if the socket pair between the parent process and child
-   *  process cannot be created, and the caller should call strerror() to check
-   *  the unix error code. kLibEventError if bufferevent_socket_new() fails.
-   *  kCgroupError if CgroupManager cannot move the process to the cgroup bound
-   *  to the TaskInstance. kProtobufError if the communication between the
-   *  parent and the child process fails.
-   */
-  static CraneErr SpawnProcessInInstance_(TaskInstance* instance,
-                                          ProcessInstance* process);
+  void LaunchTaskInstanceMt_(TaskInstance* instance);
+
+  CraneErr SpawnProcessInInstance_(TaskInstance* instance,
+                                   ProcessInstance* process);
 
   const TaskInstance* FindInstanceByTaskId_(uint32_t task_id);
 
@@ -328,7 +333,7 @@ class TaskManager {
         std::chrono::duration_cast<std::chrono::microseconds>(duration - sec)
             .count()};
 
-    struct event* ev = event_new(m_ev_base_, -1, 0, EvOnTimerCb_, arg);
+    struct event* ev = event_new(m_ev_base_, -1, 0, EvOnTaskTimerCb_, arg);
     CRANE_ASSERT_MSG(ev != nullptr, "Failed to create new timer.");
     evtimer_add(ev, &tv);
 
@@ -342,7 +347,7 @@ class TaskManager {
 
     timeval tv{static_cast<__time_t>(secs), 0};
 
-    struct event* ev = event_new(m_ev_base_, -1, 0, EvOnTimerCb_, arg);
+    struct event* ev = event_new(m_ev_base_, -1, 0, EvOnTaskTimerCb_, arg);
     CRANE_ASSERT_MSG(ev != nullptr, "Failed to create new timer.");
     evtimer_add(ev, &tv);
 
@@ -391,27 +396,19 @@ class TaskManager {
   // and doesn't have the ownership of underlying objects.
   // A TaskInstance may contain more than one ProcessInstance.
   absl::flat_hash_map<uint32_t /*pid*/, TaskInstance*> m_pid_task_map_
-      GUARDED_BY(m_mtx_);
+      ABSL_GUARDED_BY(m_mtx_);
   absl::flat_hash_map<uint32_t /*pid*/, ProcessInstance*> m_pid_proc_map_
-      GUARDED_BY(m_mtx_);
+      ABSL_GUARDED_BY(m_mtx_);
 
   absl::Mutex m_mtx_;
-
-  util::AtomicHashMap<absl::flat_hash_map, task_id_t, uid_t>
-      m_task_id_to_uid_map_;
-
-  util::AtomicHashMap<absl::flat_hash_map, task_id_t,
-                      std::unique_ptr<util::Cgroup>>
-      m_task_id_to_cg_map_;
-
-  util::AtomicHashMap<absl::flat_hash_map, uid_t /*uid*/,
-                      absl::flat_hash_set<task_id_t>>
-      m_uid_to_task_ids_map_;
 
   // Critical data region ends
   // ========================================================================
 
   static void EvSigchldCb_(evutil_socket_t sig, short events, void* user_data);
+
+  static void EvProcessSigchldCb_(evutil_socket_t sig, short events,
+                                  void* user_data);
 
   // Callback function to handle SIGINT sent by Ctrl+C
   static void EvSigintCb_(evutil_socket_t sig, short events, void* user_data);
@@ -419,11 +416,12 @@ class TaskManager {
   static void EvGrpcExecuteTaskCb_(evutil_socket_t efd, short events,
                                    void* user_data);
 
-  static void EvGrpcSpawnInteractiveTaskCb_(evutil_socket_t efd, short events,
-                                            void* user_data);
-
   static void EvGrpcQueryTaskIdFromPidCb_(evutil_socket_t efd, short events,
                                           void* user_data);
+
+  static void EvGrpcQueryTaskEnvironmentVariableCb_(evutil_socket_t efd,
+                                                    short events,
+                                                    void* user_data);
 
   static void EvSubprocessReadCb_(struct bufferevent* bev, void* process);
 
@@ -441,7 +439,9 @@ class TaskManager {
 
   static void EvExitEventCb_(evutil_socket_t, short events, void* user_data);
 
-  static void EvOnTimerCb_(evutil_socket_t, short, void* arg);
+  static void EvOnTaskTimerCb_(evutil_socket_t, short, void* arg_);
+
+  static void EvOnSigchldTimerCb_(evutil_socket_t, short, void* arg_);
 
   struct event_base* m_ev_base_{};
   struct event* m_ev_sigchld_{};
@@ -458,15 +458,15 @@ class TaskManager {
   // ev_sigchld_cb_ will stop the event loop when there is no task running.
   std::atomic_bool m_is_ending_now_{false};
 
-  // When a new task grpc message arrives, the grpc function (which
-  //  runs in parallel) uses m_grpc_event_fd_ to inform the event
-  //  loop thread and the event loop thread retrieves the message
-  //  from m_grpc_reqs_. We use this to keep thread-safety.
-  struct event* m_ev_grpc_interactive_task_{};
-  ConcurrentQueue<EvQueueGrpcInteractiveTask> m_grpc_interactive_task_queue_;
+  struct event* m_ev_process_sigchld_{};
+  ConcurrentQueue<std::unique_ptr<ProcSigchldInfo>> m_sigchld_queue_;
 
   struct event* m_ev_query_task_id_from_pid_{};
   ConcurrentQueue<EvQueueQueryTaskIdFromPid> m_query_task_id_from_pid_queue_;
+
+  struct event* m_ev_query_task_environment_variables_{};
+  ConcurrentQueue<EvQueueQueryTaskEnvironmentVariables>
+      m_query_task_environment_variables_queue;
 
   // A custom event that handles the ExecuteTask RPC.
   struct event* m_ev_grpc_execute_task_{};

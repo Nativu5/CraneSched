@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -37,14 +39,13 @@ class CranedStub {
 
   ~CranedStub();
 
-  static crane::grpc::ExecuteTasksRequest NewExecuteTasksRequest(
-      const std::vector<TaskInCtld *> &tasks);
+  static crane::grpc::ExecuteTasksRequest NewExecuteTasksRequests(
+      const CranedId &craned_id, const std::vector<TaskInCtld *> &tasks);
 
   std::vector<task_id_t> ExecuteTasks(
       const crane::grpc::ExecuteTasksRequest &request);
 
-  CraneErr CreateCgroupForTasks(
-      std::vector<std::pair<task_id_t, uid_t>> const &task_uid_pairs);
+  CraneErr CreateCgroupForTasks(std::vector<CgroupSpec> const &cgroup_specs);
 
   CraneErr ReleaseCgroupForTasks(
       const std::vector<std::pair<task_id_t, uid_t>> &task_uid_pairs);
@@ -56,6 +57,8 @@ class CranedStub {
   CraneErr CheckTaskStatus(task_id_t task_id, crane::grpc::TaskStatus *status);
 
   CraneErr ChangeTaskTimeLimit(uint32_t task_id, uint64_t seconds);
+
+  CraneErr QueryCranedRemoteMeta(CranedRemoteMeta *meta);
 
   bool Invalid() const { return m_invalid_; }
 
@@ -157,13 +160,13 @@ class CranedKeeper {
 
   Mutex m_connected_craned_mtx_;
   NodeHashMap<CranedId, std::shared_ptr<CranedStub>>
-      m_connected_craned_id_stub_map_ GUARDED_BY(m_connected_craned_mtx_);
+      m_connected_craned_id_stub_map_ ABSL_GUARDED_BY(m_connected_craned_mtx_);
 
   Mutex m_unavail_craned_set_mtx_;
   std::unordered_set<CranedId> m_unavail_craned_set_
-      GUARDED_BY(m_unavail_craned_set_mtx_);
+      ABSL_GUARDED_BY(m_unavail_craned_set_mtx_);
   std::unordered_set<CranedId> m_connecting_craned_set_
-      GUARDED_BY(m_unavail_craned_set_mtx_);
+      ABSL_GUARDED_BY(m_unavail_craned_set_mtx_);
 
   std::vector<grpc::CompletionQueue> m_cq_vec_;
   std::vector<Mutex> m_cq_mtx_vec_;

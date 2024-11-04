@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CtldClient.h"
@@ -31,28 +33,13 @@ void CtldClient::InitChannelAndStub(const std::string& server_address) {
   if (g_config.CompressedRpc)
     channel_args.SetCompressionAlgorithm(GRPC_COMPRESS_GZIP);
 
-  if (g_config.ListenConf.UseTls) {
-    std::string ctld_address = fmt::format("{}.{}:{}", server_address,
-                                           g_config.ListenConf.DomainSuffix,
-                                           g_config.CraneCtldListenPort);
-
-    grpc::SslCredentialsOptions ssl_opts;
-    // pem_root_certs is actually the certificate of server side rather than
-    // CA certificate. CA certificate is not needed.
-    // Since we use the same cert/key pair for both cranectld/craned,
-    // pem_root_certs is set to the same certificate.
-    ssl_opts.pem_root_certs = g_config.ListenConf.ServerCertContent;
-    ssl_opts.pem_cert_chain = g_config.ListenConf.ServerCertContent;
-    ssl_opts.pem_private_key = g_config.ListenConf.ServerKeyContent;
-
-    m_ctld_channel_ = grpc::CreateCustomChannel(
-        ctld_address, grpc::SslCredentials(ssl_opts), channel_args);
-  } else {
-    std::string ctld_address =
-        fmt::format("{}:{}", server_address, g_config.CraneCtldListenPort);
-    m_ctld_channel_ = grpc::CreateCustomChannel(
-        ctld_address, grpc::InsecureChannelCredentials(), channel_args);
-  }
+  if (g_config.ListenConf.UseTls)
+    m_ctld_channel_ = CreateTcpTlsCustomChannelByHostname(
+        server_address, g_config.CraneCtldListenPort,
+        g_config.ListenConf.TlsCerts, channel_args);
+  else
+    m_ctld_channel_ = CreateTcpInsecureCustomChannel(
+        server_address, g_config.CraneCtldListenPort, channel_args);
 
   // std::unique_ptr will automatically release the dangling stub.
   m_stub_ = CraneCtld::NewStub(m_ctld_channel_);
@@ -191,9 +178,9 @@ void CtldClient::AsyncSendThread_() {
         CRANE_ERROR(
             "Failed to send TaskStatusChange: "
             "{{TaskId: {}, NewStatus: {}}}, reason: {} | {}, code: {}",
-            status_change.task_id, status_change.new_status,
+            status_change.task_id, int(status_change.new_status),
             status.error_message(), context.debug_error_string(),
-            status.error_code());
+            int(status.error_code()));
 
         if (status.error_code() == grpc::UNAVAILABLE) {
           // If some messages are not sent due to channel failure,

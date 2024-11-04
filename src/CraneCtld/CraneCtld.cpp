@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CtldPreCompiledHeader.h"
@@ -23,16 +25,20 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cxxopts.hpp>
+#include <filesystem>
 
 #include "AccountManager.h"
 #include "CranedKeeper.h"
 #include "CranedMetaContainer.h"
 #include "CtldGrpcServer.h"
+#include "CtldPublicDefs.h"
 #include "DbClient.h"
 #include "EmbeddedDbClient.h"
 #include "TaskScheduler.h"
+#include "crane/Logger.h"
 #include "crane/Network.h"
 #include "crane/OS.h"
+#include "crane/PluginClient.h"
 
 void ParseConfig(int argc, char** argv) {
   cxxopts::Options options("cranectld");
@@ -43,14 +49,33 @@ void ParseConfig(int argc, char** argv) {
       cxxopts::value<std::string>()->default_value(kDefaultConfigPath))
       ("D,db-config", "Path to DB configuration file",
        cxxopts::value<std::string>()->default_value(kDefaultDbConfigPath))
-      ("l,listen", "listening address",
+      ("l,listen", "Listening address, format: <IP>:<port>",
       cxxopts::value<std::string>()->default_value("0.0.0.0"))
-      ("p,port", "listening port",
+      ("p,port", "Listening port, format: <IP>:<port>",
       cxxopts::value<std::string>()->default_value(kCtldDefaultPort))
+      ("v,version", "Display version information")
+      ("h,help", "Display help for CraneCtld")
       ;
   // clang-format on
 
-  auto parsed_args = options.parse(argc, argv);
+  cxxopts::ParseResult parsed_args;
+  try {
+    parsed_args = options.parse(argc, argv);
+  } catch (cxxopts::OptionException& e) {
+    CRANE_ERROR("{}\n{}", e.what(), options.help());
+    std::exit(1);
+  }
+
+  if (parsed_args.count("help") > 0) {
+    fmt::print("{}\n", options.help());
+    std::exit(0);
+  }
+
+  if (parsed_args.count("version") > 0) {
+    fmt::print("Version: {}\n", CRANE_VERSION_STRING);
+    fmt::print("Build Time: {}\n", CRANE_BUILD_TIMESTAMP);
+    std::exit(0);
+  }
 
   std::string config_path = parsed_args["config"].as<std::string>();
   std::string db_config_path = parsed_args["db-config"].as<std::string>();
@@ -96,6 +121,11 @@ void ParseConfig(int argc, char** argv) {
 
       InitLogger(log_level, g_config.CraneCtldLogFile);
 
+      // External configuration file path
+      if (!parsed_args.count("db-config") && config["DbConfigPath"]) {
+        db_config_path = config["DbConfigPath"].as<std::string>();
+      }
+
       if (config["CraneCtldMutexFilePath"])
         g_config.CraneCtldMutexFilePath =
             g_config.CraneBaseDir +
@@ -120,24 +150,25 @@ void ParseConfig(int argc, char** argv) {
         g_config.CompressedRpc = config["CompressedRpc"].as<bool>();
 
       if (config["UseTls"] && config["UseTls"].as<bool>()) {
+        TlsCertificates& tls_certs = g_config.ListenConf.Certs;
+
         g_config.ListenConf.UseTls = true;
 
         if (config["DomainSuffix"])
-          g_config.ListenConf.DomainSuffix =
-              config["DomainSuffix"].as<std::string>();
+          tls_certs.DomainSuffix = config["DomainSuffix"].as<std::string>();
 
         if (config["ServerCertFilePath"]) {
-          g_config.ListenConf.ServerCertFilePath =
+          tls_certs.ServerCertFilePath =
               config["ServerCertFilePath"].as<std::string>();
 
           try {
-            g_config.ListenConf.ServerCertContent = util::ReadFileIntoString(
-                g_config.ListenConf.ServerCertFilePath);
+            tls_certs.ServerCertContent =
+                util::ReadFileIntoString(tls_certs.ServerCertFilePath);
           } catch (const std::exception& e) {
             CRANE_ERROR("Read cert file error: {}", e.what());
             std::exit(1);
           }
-          if (g_config.ListenConf.ServerCertContent.empty()) {
+          if (tls_certs.ServerCertContent.empty()) {
             CRANE_ERROR(
                 "UseTls is true, but the file specified by ServerCertFilePath "
                 "is empty");
@@ -148,17 +179,17 @@ void ParseConfig(int argc, char** argv) {
         }
 
         if (config["ServerKeyFilePath"]) {
-          g_config.ListenConf.ServerKeyFilePath =
+          tls_certs.ServerKeyFilePath =
               config["ServerKeyFilePath"].as<std::string>();
 
           try {
-            g_config.ListenConf.ServerKeyContent =
-                util::ReadFileIntoString(g_config.ListenConf.ServerKeyFilePath);
+            tls_certs.ServerKeyContent =
+                util::ReadFileIntoString(tls_certs.ServerKeyFilePath);
           } catch (const std::exception& e) {
             CRANE_ERROR("Read cert file error: {}", e.what());
             std::exit(1);
           }
-          if (g_config.ListenConf.ServerKeyContent.empty()) {
+          if (tls_certs.ServerKeyContent.empty()) {
             CRANE_ERROR(
                 "UseTls is true, but the file specified by ServerKeyFilePath "
                 "is empty");
@@ -169,10 +200,6 @@ void ParseConfig(int argc, char** argv) {
         }
       } else {
         g_config.ListenConf.UseTls = false;
-      }
-
-      if (config["DbConfigPath"]) {
-        db_config_path = config["DbConfigPath"].as<std::string>();
       }
 
       if (config["CraneCtldForeground"]) {
@@ -296,16 +323,16 @@ void ParseConfig(int argc, char** argv) {
              ++it) {
           auto node = it->as<YAML::Node>();
           auto node_ptr = std::make_shared<Ctld::Config::Node>();
-          std::list<std::string> name_list;
+          std::list<std::string> node_id_list;
 
           if (node["name"]) {
-            if (!util::ParseHostList(node["name"].Scalar(), &name_list)) {
+            if (!util::ParseHostList(node["name"].Scalar(), &node_id_list)) {
               CRANE_ERROR("Illegal node name string format.");
               std::exit(1);
             }
 
             CRANE_TRACE("node name list parsed: {}",
-                        fmt::join(name_list, ", "));
+                        fmt::join(node_id_list, ", "));
           } else
             std::exit(1);
 
@@ -334,7 +361,49 @@ void ParseConfig(int argc, char** argv) {
             node_ptr->memory_bytes = memory_bytes;
           } else
             std::exit(1);
-          for (auto&& name : name_list) g_config.Nodes[name] = node_ptr;
+
+          DedicatedResourceInNode resourceInNode;
+          if (node["gres"]) {
+            for (auto gres_it = node["gres"].begin();
+                 gres_it != node["gres"].end(); ++gres_it) {
+              const auto& gres_node = gres_it->as<YAML::Node>();
+              const auto& device_name = gres_node["name"].as<std::string>();
+              const auto& device_type = gres_node["type"].as<std::string>();
+              if (gres_node["DeviceFileRegex"]) {
+                std::list<std::string> device_path_list;
+                if (!util::ParseHostList(gres_node["DeviceFileRegex"].Scalar(),
+                                         &device_path_list)) {
+                  CRANE_ERROR(
+                      "Illegal gres {}:{} DeviceFileRegex path string format.",
+                      device_name, device_type);
+                  std::exit(1);
+                }
+                for (const auto& device_path : device_path_list) {
+                  resourceInNode.name_type_slots_map[device_name][device_type]
+                      .emplace(device_path);
+                }
+              }
+
+              if (gres_node["DeviceFileList"]) {
+                std::list<std::string> device_path_list;
+                if (!util::ParseHostList(gres_node["DeviceFileList"].Scalar(),
+                                         &device_path_list)) {
+                  CRANE_ERROR(
+                      "Illegal gres {}:{} DeviceFileList path string format.",
+                      device_name, device_type);
+                  std::exit(1);
+                }
+
+                resourceInNode.name_type_slots_map[device_name][device_type]
+                    .emplace(device_path_list.front());
+              }
+            }
+          }
+
+          for (auto&& node_id : node_id_list) {
+            g_config.Nodes[node_id] = node_ptr;
+            g_config.Nodes[node_id]->dedicated_resource = resourceInNode;
+          }
         }
       }
 
@@ -388,6 +457,37 @@ void ParseConfig(int argc, char** argv) {
             }
           }
 
+          if (partition["DefaultMemPerCpu"] &&
+              !partition["DefaultMemPerCpu"].IsNull()) {
+            part.default_mem_per_cpu =
+                partition["DefaultMemPerCpu"].as<uint64_t>() * 1024 * 1024;
+          }
+          if (part.default_mem_per_cpu == 0) {
+            uint64_t part_mem = 0;
+            uint32_t part_cpu = 0;
+            for (const auto& node : part.nodes) {
+              part_cpu += g_config.Nodes[node]->cpu;
+              part_mem += g_config.Nodes[node]->memory_bytes;
+            }
+            part.default_mem_per_cpu = part_mem / part_cpu;
+          }
+
+          if (partition["MaxMemPerCpu"] &&
+              !partition["MaxMemPerCpu"].IsNull()) {
+            part.max_mem_per_cpu =
+                partition["MaxMemPerCpu"].as<uint64_t>() * 1024 * 1024;
+          } else
+            part.max_mem_per_cpu = 0;
+
+          if (part.default_mem_per_cpu != 0 && part.max_mem_per_cpu != 0 &&
+              part.max_mem_per_cpu < part.default_mem_per_cpu) {
+            CRANE_ERROR(
+                "The partition {} MaxMemPerCpu {}MB should not be "
+                "less than DefaultMemPerCpu {}MB",
+                name, part.default_mem_per_cpu, part.max_mem_per_cpu);
+            std::exit(1);
+          }
+
           g_config.Partitions.emplace(std::move(name), std::move(part));
         }
       }
@@ -413,6 +513,23 @@ void ParseConfig(int argc, char** argv) {
           std::exit(1);
         }
       }
+
+      if (config["Plugin"]) {
+        const auto& plugin_config = config["Plugin"];
+
+        if (plugin_config["Enabled"])
+          g_config.Plugin.Enabled = plugin_config["Enabled"].as<bool>();
+
+        if (plugin_config["PlugindSockPath"]) {
+          g_config.Plugin.PlugindSockPath =
+              fmt::format("unix://{}{}", g_config.CraneBaseDir,
+                          plugin_config["PlugindSockPath"].as<std::string>());
+        } else {
+          g_config.Plugin.PlugindSockPath =
+              fmt::format("unix://{}{}", g_config.CraneBaseDir,
+                          kDefaultPlugindUnixSockPath);
+        }
+      }
     } catch (YAML::BadFile& e) {
       CRANE_CRITICAL("Can't open config file {}: {}", config_path, e.what());
       std::exit(1);
@@ -433,10 +550,13 @@ void ParseConfig(int argc, char** argv) {
       else
         g_config.CraneEmbeddedDbBackend = "Unqlite";
 
-      if (config["CraneCtldDbPath"] && !config["CraneCtldDbPath"].IsNull())
-        g_config.CraneCtldDbPath =
-            g_config.CraneBaseDir + config["CraneCtldDbPath"].as<std::string>();
-      else
+      if (config["CraneCtldDbPath"] && !config["CraneCtldDbPath"].IsNull()) {
+        std::filesystem::path path(config["CraneCtldDbPath"].as<std::string>());
+        if (path.is_absolute())
+          g_config.CraneCtldDbPath = path.string();
+        else
+          g_config.CraneCtldDbPath = g_config.CraneBaseDir + path.string();
+      } else
         g_config.CraneCtldDbPath =
             g_config.CraneBaseDir + kDefaultCraneCtldDbPath;
 
@@ -486,19 +606,15 @@ void ParseConfig(int argc, char** argv) {
         parsed_args["port"].as<std::string>();
   }
 
-  std::regex regex_addr(
-      R"(^((25[0-5]|(2[0-4]|1[0-9]|[1-9]|)[0-9])(\.(?!$)|$)){4}$)");
-
-  std::regex regex_port(R"(^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|)"
-                        R"(65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$)");
-
-  if (!std::regex_match(g_config.ListenConf.CraneCtldListenAddr, regex_addr)) {
-    fmt::print("Listening address is invalid.\n");
+  if (crane::GetIpAddrVer(g_config.ListenConf.CraneCtldListenAddr) == -1) {
+    CRANE_ERROR("Listening address is invalid.");
     std::exit(1);
   }
 
+  std::regex regex_port(R"(^([0-9]{1,4}|[1-5][0-9]{4}|6[0-4][0-9]{3}|)"
+                        R"(65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$)");
   if (!std::regex_match(g_config.ListenConf.CraneCtldListenPort, regex_port)) {
-    fmt::print("Listening port is invalid.\n");
+    CRANE_ERROR("Listening port is invalid.");
     std::exit(1);
   }
 }
@@ -508,6 +624,8 @@ void DestroyCtldGlobalVariables() {
 
   g_task_scheduler.reset();
   g_craned_keeper.reset();
+
+  g_plugin_client.reset();
 
   // In case that spdlog is destructed before g_embedded_db_client->Close()
   // in which log function is called.
@@ -546,12 +664,18 @@ void InitializeCtldGlobalVariables() {
     std::exit(1);
   }
 
+  if (g_config.Plugin.Enabled) {
+    CRANE_INFO("[Plugin] Plugin module is enabled.");
+    g_plugin_client = std::make_unique<plugin::PluginClient>();
+    g_plugin_client->InitChannelAndStub(g_config.Plugin.PlugindSockPath);
+  }
+
   // Account manager must be initialized before Task Scheduler
   // since the recovery stage of the task scheduler will acquire
   // information from account manager.
   g_account_manager = std::make_unique<AccountManager>();
 
-  g_meta_container = std::make_unique<CranedMetaContainerSimpleImpl>();
+  g_meta_container = std::make_unique<CranedMetaContainer>();
   g_meta_container->InitFromConfig(g_config);
 
   bool ok;
@@ -571,12 +695,14 @@ void InitializeCtldGlobalVariables() {
         "A new node #{} is up now. Add its resource to the global resource "
         "pool.",
         craned_id);
-    g_meta_container->CranedUp(craned_id);
+
+    g_thread_pool->detach_task(
+        [craned_id]() { g_meta_container->CranedUp(craned_id); });
   });
 
   g_craned_keeper->SetCranedIsDownCb([](const CranedId& craned_id) {
     CRANE_TRACE(
-        "CranedNode #{} is down now."
+        "CranedNode #{} is down now. "
         "Remove its resource from the global resource pool.",
         craned_id);
     g_meta_container->CranedDown(craned_id);

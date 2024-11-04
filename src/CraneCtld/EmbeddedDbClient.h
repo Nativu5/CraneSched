@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -219,6 +221,21 @@ class EmbeddedDbClient {
         .has_value();
   }
 
+  bool UpdateRuntimeAttrOfTaskIfExists(
+      txn_id_t txn_id, db_id_t db_id,
+      crane::grpc::RuntimeAttrOfTask const& runtime_attr) {
+    return StoreTypeIntoDbIfExists_(m_variable_db_.get(), txn_id,
+                            GetVariableDbEntryName_(db_id), &runtime_attr)
+        .has_value();
+  }
+
+  bool UpdateTaskToCtldIfExists(txn_id_t txn_id, db_id_t db_id,
+                               crane::grpc::TaskToCtld const& task_to_ctld) {
+    return StoreTypeIntoDbIfExists_(m_fixed_db_.get(), txn_id,
+                                   GetFixedDbEntryName_(db_id), &task_to_ctld)
+        .has_value();
+  }
+
   bool FetchTaskDataInDb(txn_id_t txn_id, db_id_t db_id,
                          TaskInEmbeddedDb* task_in_db) {  // Only used in test
     return FetchTaskDataInDbAtomic_(txn_id, db_id, task_in_db).has_value();
@@ -396,6 +413,65 @@ class EmbeddedDbClient {
                                                      std::string const& key,
                                                      const T* value) {
     return db->Store(txn_id, key, value, sizeof(T));
+  }
+
+  template <typename T>
+  result::result<void, DbErrorCode> StoreTypeIntoDbIfExists_(
+      IEmbeddedDb* db, txn_id_t txn_id, const std::string& key, const T* value)
+    requires std::derived_from<T, google::protobuf::MessageLite>
+  {
+    using google::protobuf::io::CodedOutputStream;
+    using google::protobuf::io::StringOutputStream;
+
+    std::string buf;
+    StringOutputStream stringOutputStream(&buf);
+    CodedOutputStream codedOutputStream(&stringOutputStream);
+
+    size_t n_bytes{value->ByteSizeLong()};
+    value->SerializeToCodedStream(&codedOutputStream);
+
+    if (!BeginDbTransaction_(db, &txn_id))
+      return result::failure(DbErrorCode::kOther);
+
+    size_t len = 0;
+    auto fetch_result = db->Fetch(txn_id, key, nullptr, &len);
+    if (fetch_result.has_error()) {
+      if (fetch_result.error() == DbErrorCode::kNotFound) {
+        CommitDbTransaction_(db, txn_id);
+        return {};
+      }
+      return result::failure(fetch_result.error());
+    }
+
+    auto store_result = StoreTypeIntoDb_(db, txn_id, key, value);
+    if (store_result.has_error()) return result::failure(store_result.error());
+
+    CommitDbTransaction_(db, txn_id);
+    return {};
+  }
+
+  template <std::integral T>
+  result::result<void, DbErrorCode> StoreTypeIntoDbIfExists_(
+      IEmbeddedDb* db, txn_id_t txn_id, const std::string& key,
+      const T* value) {
+    if (!BeginDbTransaction_(db, &txn_id))
+      return result::failure(DbErrorCode::kOther);
+
+    size_t len = 0;
+    auto fetch_result = db->Fetch(txn_id, key, nullptr, &len);
+    if (fetch_result.has_error()) {
+      if (fetch_result.error() == DbErrorCode::kNotFound) {
+        CommitDbTransaction_(db, txn_id);
+        return {};
+      }
+      return result::failure(fetch_result.error());
+    }
+
+    auto store_result = StoreTypeIntoDb_(db, txn_id, key, value);
+    if (store_result.has_error()) return result::failure(store_result.error());
+
+    CommitDbTransaction_(db, txn_id);
+    return {};
   }
 
   // -----------

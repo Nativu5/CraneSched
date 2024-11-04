@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "crane/String.h"
@@ -340,6 +342,73 @@ void SetCurrentThreadName(const std::string &name) {
   }
 
   pthread_setname_np(pthread_self(), name.c_str());
+}
+
+bool ConvertStringToInt64(const std::string &s, int64_t *val) {
+  std::from_chars_result convert_result{};
+  convert_result = std::from_chars(s.data(), s.data() + s.size(), *val);
+  return convert_result.ec == std::errc();
+}
+
+std::string ReadableTypedDeviceMap(const DeviceMap &device_map) {
+  if (device_map.empty()) return "None";
+
+  std::vector<std::string> typed_device_str_vec;
+  for (const auto &[dev_name, p] : device_map) {
+    const auto &type_size_map = p.second;
+
+    for (const auto &[dev_type, size] : type_size_map) {
+      typed_device_str_vec.push_back(
+          fmt::format("{}:{}:{}", dev_name, dev_type, size));
+    }
+  }
+
+  return absl::StrJoin(typed_device_str_vec, ",");
+}
+
+std::string ReadableDresInNode(const ResourceInNode &resource_in_node) {
+  const DedicatedResourceInNode &dedicated_resource_in_node =
+      resource_in_node.dedicated_res;
+
+  if (dedicated_resource_in_node.IsZero()) {
+    return "0";
+  }
+  std::vector<std::string> node_gres_string_vector;
+  for (const auto &[device_name, type_slots_map] :
+       dedicated_resource_in_node.name_type_slots_map) {
+    for (const auto &[device_type, slots] : type_slots_map.type_slots_map) {
+      // name:type:count
+      node_gres_string_vector.emplace_back(
+          fmt::format("{}:{}:{}", device_name, device_type, slots.size()));
+    }
+  }
+
+  return absl::StrJoin(node_gres_string_vector, ",");
+}
+
+std::string ReadableGrpcDresInNode(
+    const crane::grpc::DedicatedResourceInNode &dres_in_node) {
+  if (dres_in_node.name_type_map_size() == 0) return "None";
+
+  std::vector<std::string> typed_device_str_vec;
+  for (const auto &[dev_name, p] : dres_in_node.name_type_map()) {
+    const auto &type_size_map = p.type_slots_map();
+
+    for (const auto &[dev_type, slots] : type_size_map)
+      typed_device_str_vec.push_back(
+          fmt::format("{}:{}:{}", dev_name, dev_type, slots.slots_size()));
+  }
+
+  return absl::StrJoin(typed_device_str_vec, ",");
+}
+
+std::string GenerateCommaSeparatedString(const int val) {
+  std::vector<int> val_vec;
+  val_vec.reserve(val);
+  for (int i = 0; i < val; ++i) {
+    val_vec.push_back(i);
+  }
+  return absl::StrJoin(val_vec, ",");
 }
 
 }  // namespace util

@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include <fmt/format.h>
@@ -66,9 +68,9 @@ extern "C" {
     return PAM_USER_UNKNOWN;
   }
 
-  uint8_t addr[4];
+  std::string remote_address;
   uint16_t port;
-  ok = PamGetRemoteAddressPort(pamh, addr, &port);
+  ok = PamGetRemoteAddressPort(pamh, &remote_address, &port);
 
   if (!ok) {
     PamSendMsgToClient(
@@ -77,9 +79,6 @@ extern "C" {
   }
 
   uint32_t task_id;
-
-  std::string remote_address =
-      fmt::format("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
 
   pam_syslog(pamh, LOG_ERR, "[Crane] Try to query %s for remote port %hu",
              remote_address.c_str(), port);
@@ -103,7 +102,9 @@ extern "C" {
 
     pam_syslog(pamh, LOG_ERR,
                "[Crane] Rejected ssh connection with remote port %hu ", port);
-    PamSendMsgToClient(pamh, "Rejected by CraneD PAM Module.");
+    PamSendMsgToClient(pamh,
+                       "You don't have any active job on this node. "
+                       "Your SSH request was rejected by Crane PAM Module.");
     return PAM_PERM_DENIED;
   }
 }
@@ -149,11 +150,15 @@ extern "C" {
 
     task_id = std::atoi(task_id_str);
 
-    ok = GrpcMigrateSshProcToCgroup(pamh, getpid(), task_id);
-    if (ok)
+    ok = GrpcMigrateSshProcToCgroupAndSetEnv(pamh, getpid(), task_id);
+    if (ok) {
       return PAM_SUCCESS;
-    else
+    } else {
+      PamSendMsgToClient(pamh,
+                         "You don't have any active job on this node. "
+                         "Your SSH request was rejected by Crane PAM Module.");
       return PAM_SESSION_ERR;
+    }
   } else {
     // If auth result is false, it indicates that system administrator allow a
     // user with no task running to log in, and then we just let it pass.

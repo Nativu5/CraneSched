@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "CranedServer.h"
@@ -23,302 +25,6 @@
 #include "CtldClient.h"
 
 namespace Craned {
-
-Status CranedServiceImpl::SrunXStream(
-    ServerContext *context,
-    ServerReaderWriter<SrunXStreamReply, SrunXStreamRequest> *stream) {
-  CRANE_DEBUG("SrunX connects from {}", context->peer());
-
-  enum class StreamState {
-    kNegotiation = 0,
-    kCheckResource,
-    kExecutiveInfo,
-    kWaitForEofOrSigOrTaskEnd,
-    kFinish,
-    kAbort
-  };
-
-  CraneErr err;
-  bool ok;
-  SrunXStreamRequest request;
-  SrunXStreamReply reply;
-
-  // gRPC doesn't support parallel Write() on the same stream.
-  // Use mutex to guarantee serial Write() in SrunXStream.
-  std::mutex stream_w_mtx;
-
-  // A task id is bound to one connection.
-  uint32_t task_id;
-  // A resource uuid is bound to one task.
-  // uuid resource_uuid{};
-
-  StreamState state = StreamState::kNegotiation;
-  while (true) {
-    switch (state) {
-      case StreamState::kNegotiation:
-        ok = stream->Read(&request);
-        if (ok) {
-          if (request.type() != SrunXStreamRequest::NegotiationType) {
-            CRANE_DEBUG("Expect negotiation from peer {}, but none.",
-                        context->peer());
-            state = StreamState::kAbort;
-          } else {
-            CRANE_DEBUG("Negotiation from peer: {}", context->peer());
-            reply.Clear();
-            reply.set_type(SrunXStreamReply::ResultType);
-            reply.mutable_result()->set_ok(true);
-
-            stream_w_mtx.lock();
-            stream->Write(reply);
-            stream_w_mtx.unlock();
-
-            state = StreamState::kCheckResource;
-          }
-        } else {
-          CRANE_DEBUG(
-              "Connection error when trying reading negotiation from peer {}",
-              context->peer());
-          state = StreamState::kAbort;
-        }
-        break;
-
-      case StreamState::kCheckResource:
-        ok = stream->Read(&request);
-        if (ok) {
-          if (request.type() != SrunXStreamRequest::CheckResourceType) {
-            CRANE_DEBUG("Expect CheckResource from peer {}, but got {}.",
-                        context->peer(), request.GetTypeName());
-            state = StreamState::kAbort;
-          } else {
-            // std::copy(request.check_resource().resource_uuid().begin(),
-            //           request.check_resource().resource_uuid().end(),
-            //           resource_uuid.data);
-
-            task_id = request.check_resource().task_id();
-            // Check the validity of resource uuid provided by client.
-            // err = g_server->CheckValidityOfResourceUuid(resource_uuid,
-            // task_id);
-            if (err != CraneErr::kOk) {
-              // The resource uuid provided by Client is invalid. Reject.
-              reply.Clear();
-              reply.set_type(SrunXStreamReply::ResultType);
-
-              auto *result = reply.mutable_result();
-              result->set_ok(false);
-              result->set_reason(
-                  fmt::format("Resource uuid invalid: {}",
-                              (err == CraneErr::kNonExistent
-                                   ? "Not Existent"
-                                   : "It doesn't match with task_id")));
-
-              stream_w_mtx.lock();
-              stream->Write(reply, grpc::WriteOptions());
-              stream_w_mtx.unlock();
-
-              state = StreamState::kFinish;
-            } else {
-              reply.Clear();
-              reply.set_type(SrunXStreamReply::ResultType);
-              reply.mutable_result()->set_ok(true);
-
-              stream_w_mtx.lock();
-              stream->Write(reply);
-              stream_w_mtx.unlock();
-
-              state = StreamState::kExecutiveInfo;
-            }
-          }
-        } else {
-          CRANE_DEBUG(
-              "Connection error when trying reading negotiation from peer {}",
-              context->peer());
-          state = StreamState::kAbort;
-        }
-
-        break;
-      case StreamState::kExecutiveInfo:
-        ok = stream->Read(&request);
-        if (ok) {
-          if (request.type() != SrunXStreamRequest::ExecutiveInfoType) {
-            CRANE_DEBUG("Expect CheckResource from peer {}, but got {}.",
-                        context->peer(), request.GetTypeName());
-            state = StreamState::kAbort;
-          } else {
-            std::forward_list<std::string> arguments;
-            auto iter = arguments.before_begin();
-            for (const auto &arg : request.exec_info().arguments()) {
-              iter = arguments.emplace_after(iter, arg);
-            }
-
-            // We have checked the validity of resource uuid. Now execute it.
-
-            // It's safe to call stream->Write() on a closed stream.
-            // (stream->Write() just return false rather than throwing an
-            // exception).
-            auto output_callback = [stream, &write_mtx = stream_w_mtx](
-                                       std::string &&buf, void *user_data) {
-              CRANE_TRACE("Output Callback called. buf: {}", buf);
-              crane::grpc::SrunXStreamReply reply;
-              reply.set_type(SrunXStreamReply::IoRedirectionType);
-
-              std::string *reply_buf = reply.mutable_io()->mutable_buf();
-              *reply_buf = std::move(buf);
-
-              write_mtx.lock();
-              stream->Write(reply);
-              write_mtx.unlock();
-
-              CRANE_TRACE("stream->Write() done.");
-            };
-
-            // Call stream->Write() and cause the grpc thread
-            // that owns 'stream' to stop the connection handling and quit.
-            auto finish_callback =
-                [stream, &write_mtx = stream_w_mtx /*, context*/](
-                    bool is_terminated_by_signal, int value, void *user_data) {
-                  CRANE_TRACE("Finish Callback called. signaled: {}, value: {}",
-                              is_terminated_by_signal, value);
-                  crane::grpc::SrunXStreamReply reply;
-                  reply.set_type(SrunXStreamReply::ExitStatusType);
-
-                  crane::grpc::StreamReplyExitStatus *stat =
-                      reply.mutable_exit_status();
-                  stat->set_reason(
-                      is_terminated_by_signal
-                          ? crane::grpc::StreamReplyExitStatus::Signal
-                          : crane::grpc::StreamReplyExitStatus::Normal);
-                  stat->set_value(value);
-
-                  // stream->WriteLast() shall not be used here.
-                  // On the server side, WriteLast cause all the Write() to be
-                  // blocked until the service handler returned.
-                  // WriteLast() should actually be called on the client side.
-                  write_mtx.lock();
-                  stream->Write(reply, grpc::WriteOptions());
-                  write_mtx.unlock();
-
-                  // If this line is appended, when SrunX has no response to
-                  // WriteLast, the connection can stop anyway. Otherwise, the
-                  // connection will stop (i.e. stream->Read() returns false)
-                  // only if 1. SrunX calls stream->WriteLast() or 2. the
-                  // underlying channel is broken. However, the 2 situations
-                  // cover all situations that we can meet, so the following
-                  // line should not be added except when debugging.
-                  //
-                  // context->TryCancel();
-                };
-
-            std::list<std::string> args;
-            for (auto &&arg : request.exec_info().arguments())
-              args.push_back(arg);
-
-            err = g_task_mgr->SpawnInteractiveTaskAsync(
-                task_id, request.exec_info().executive_path(), std::move(args),
-                std::move(output_callback), std::move(finish_callback));
-            if (err == CraneErr::kOk) {
-              reply.Clear();
-              reply.set_type(SrunXStreamReply::ResultType);
-
-              auto *result = reply.mutable_result();
-              result->set_ok(true);
-
-              stream_w_mtx.lock();
-              stream->Write(reply);
-              stream_w_mtx.unlock();
-
-              state = StreamState::kWaitForEofOrSigOrTaskEnd;
-            } else {
-              reply.Clear();
-              reply.set_type(SrunXStreamReply::ResultType);
-
-              auto *result = reply.mutable_result();
-              result->set_ok(false);
-
-              if (err == CraneErr::kSystemErr)
-                result->set_reason(
-                    fmt::format("System error: {}", strerror(errno)));
-              else if (err == CraneErr::kStop)
-                result->set_reason("Server is stopping");
-              else
-                result->set_reason(fmt::format("Unknown failure. Code: . ",
-                                               uint16_t(err),
-                                               CraneErrStr(err)));
-
-              stream_w_mtx.lock();
-              stream->Write(reply);
-              stream_w_mtx.unlock();
-
-              state = StreamState::kFinish;
-            }
-          }
-        } else {
-          CRANE_DEBUG(
-              "Connection error when trying reading negotiation from peer {}",
-              context->peer());
-          state = StreamState::kAbort;
-        }
-        break;
-
-      case StreamState::kWaitForEofOrSigOrTaskEnd: {
-        ok = stream->Read(&request);
-        if (ok) {
-          if (request.type() != SrunXStreamRequest::SignalType) {
-            CRANE_DEBUG("Expect signal from peer {}, but none.",
-                        context->peer());
-            state = StreamState::kAbort;
-          } else {
-            // If ctrl+C is pressed before the task ends, inform TaskManager
-            // of the interrupt and wait for TaskManager to stop the Task.
-
-            CRANE_TRACE("Receive signum {} from client. Killing task {}",
-                        request.signum(), task_id);
-
-            // Todo: Sometimes, TaskManager can't kill a task, there're some
-            //  problems here.
-
-            g_task_mgr->TerminateTaskAsync(task_id);
-
-            // The state machine does not switch the state here.
-            // We just use stream->Read() to wait for the task to end.
-            // When the task ends, the finish_callback will shut down the
-            // stream and cause stream->Read() to return with false.
-          }
-        } else {
-          // If the task ends, the callback which handles the end of a task in
-          // TaskManager will send the task end message to client. The client
-          // will call stream->Write() to end the stream. Then the
-          // stream->Read() returns with ok = false.
-
-          state = StreamState::kFinish;
-        }
-        break;
-      }
-
-      case StreamState::kAbort: {
-        CRANE_DEBUG("Connection from peer {} aborted.", context->peer());
-
-        // Invalidate resource uuid and free the resource in use.
-        // g_server->RevokeResourceToken(resource_uuid);
-
-        return Status::CANCELLED;
-      }
-
-      case StreamState::kFinish: {
-        CRANE_TRACE("Connection from peer {} finished normally",
-                    context->peer());
-
-        // Invalidate resource uuid and free the resource in use.
-        // g_server->RevokeResourceToken(resource_uuid);
-
-        return Status::OK;
-      }
-
-      default:
-        CRANE_ERROR("Unexpected CranedServer State: {}", uint(state));
-        return Status::CANCELLED;
-    }
-  }
-}
 
 grpc::Status CranedServiceImpl::ExecuteTask(
     grpc::ServerContext *context,
@@ -341,7 +47,10 @@ grpc::Status CranedServiceImpl::TerminateTasks(
     grpc::ServerContext *context,
     const crane::grpc::TerminateTasksRequest *request,
     crane::grpc::TerminateTasksReply *response) {
-  for (const auto &id : request->task_id_list())
+  CRANE_TRACE("Receive TerminateTasks for tasks {}",
+              absl::StrJoin(request->task_id_list(), ","));
+
+  for (task_id_t id : request->task_id_list())
     g_task_mgr->TerminateTaskAsync(id);
   response->set_ok(true);
 
@@ -365,37 +74,26 @@ grpc::Status CranedServiceImpl::QueryTaskIdFromPort(
   CRANE_TRACE("Receive QueryTaskIdFromPort RPC from {}: port: {}",
               context->peer(), request->port());
 
-  std::string port_hex = fmt::format("{:0>4X}", request->port());
-
   ino_t inode;
+  bool inode_found = false;
 
   // find inode
   // 1._find_match_in_tcp_file
-  std::string tcp_path{"/proc/net/tcp"};
-  std::ifstream tcp_in(tcp_path, std::ios::in);
-  std::string tcp_line;
-  bool inode_found = false;
-  if (tcp_in) {
-    getline(tcp_in, tcp_line);  // Skip the header line
-    while (getline(tcp_in, tcp_line)) {
-      tcp_line = absl::StripAsciiWhitespace(tcp_line);
-      std::vector<std::string> tcp_line_vec =
-          absl::StrSplit(tcp_line, absl::ByAnyChar(" :"), absl::SkipEmpty());
-      CRANE_TRACE("Checking port {} == {}", port_hex, tcp_line_vec[2]);
-      if (port_hex == tcp_line_vec[2]) {
-        inode_found = true;
-        inode = std::stoul(tcp_line_vec[13]);
-        CRANE_TRACE("Inode num for port {} is {}", request->port(), inode);
-        break;
-      }
-    }
-    if (!inode_found) {
-      CRANE_TRACE("Inode num for port {} is not found.", request->port());
-      response->set_ok(false);
-      return Status::OK;
-    }
-  } else {  // can't find file
-    CRANE_ERROR("Can't open file: {}", tcp_path);
+  inode_found =
+      crane::FindTcpInodeByPort("/proc/net/tcp", request->port(), &inode);
+  if (!inode_found) {
+    CRANE_TRACE(
+        "Inode num for port {} is not found in /proc/net/tcp, try "
+        "/proc/net/tcp6.",
+        request->port());
+    inode_found =
+        crane::FindTcpInodeByPort("/proc/net/tcp6", request->port(), &inode);
+  }
+
+  if (!inode_found) {
+    CRANE_TRACE("Inode num for port {} is not found.", request->port());
+    response->set_ok(false);
+    return Status::OK;
   }
 
   // 2.find_pid_by_inode
@@ -472,16 +170,21 @@ grpc::Status CranedServiceImpl::CreateCgroupForTasks(
     grpc::ServerContext *context,
     const crane::grpc::CreateCgroupForTasksRequest *request,
     crane::grpc::CreateCgroupForTasksReply *response) {
-  std::vector<std::pair<task_id_t, uid_t>> task_id_uid_pairs;
+  std::vector<CgroupSpec> cg_specs;
   for (int i = 0; i < request->task_id_list_size(); i++) {
     task_id_t task_id = request->task_id_list(i);
     uid_t uid = request->uid_list(i);
+    crane::grpc::ResourceInNode const &res = request->res_list(i);
 
+    CgroupSpec spec{.uid = uid,
+                    .task_id = task_id,
+                    .res_in_node = std::move(res),
+                    .execution_node = request->execution_node(i)};
     CRANE_TRACE("Receive CreateCgroup for task #{}, uid {}", task_id, uid);
-    task_id_uid_pairs.emplace_back(task_id, uid);
+    cg_specs.emplace_back(std::move(spec));
   }
 
-  bool ok = g_task_mgr->CreateCgroupsAsync(std::move(task_id_uid_pairs));
+  bool ok = g_cg_mgr->CreateCgroups(std::move(cg_specs));
   if (!ok) {
     CRANE_ERROR("Failed to create cgroups for some tasks.");
   }
@@ -499,7 +202,7 @@ grpc::Status CranedServiceImpl::ReleaseCgroupForTasks(
 
     CRANE_DEBUG("Release Cgroup for task #{}", task_id);
 
-    bool ok = g_task_mgr->ReleaseCgroupAsync(task_id, uid);
+    bool ok = g_cg_mgr->ReleaseCgroup(task_id, uid);
     if (!ok) {
       CRANE_ERROR("Failed to release cgroup for task #{}, uid {}", task_id,
                   uid);
@@ -518,22 +221,47 @@ grpc::Status CranedServiceImpl::QueryTaskIdFromPortForward(
   bool remote_is_craned = false;
 
   // May be craned or cfored
-  std::string_view crane_service_port;
+  std::string crane_port;
+  std::string crane_addr = request->ssh_remote_address();
 
-  // Check whether the remote address is in the addresses of CraneD nodes.
-  if (g_config.Ipv4ToCranedHostname.contains(request->ssh_remote_address())) {
-    CRANE_TRACE(
-        "Receive QueryTaskIdFromPortForward from Pam module: "
-        "ssh_remote_port: {}, ssh_remote_address: {}. "
-        "This ssh comes from a CraneD node. uid: {}",
-        request->ssh_remote_port(), request->ssh_remote_address(),
-        request->uid());
-    // In the addresses of CraneD nodes. This ssh request comes from a CraneD
-    // node. Check if the remote port belongs to a task. If so, move it in to
-    // the cgroup of this task.
-    crane_service_port = kCranedDefaultPort;
-    remote_is_craned = true;
+  int ip_ver = crane::GetIpAddrVer(request->ssh_remote_address());
+
+  ipv4_t crane_addr4;
+  ipv6_t crane_addr6;
+  if (ip_ver == 4 && crane::StrToIpv4(crane_addr, &crane_addr4)) {
+    if (g_config.Ipv4ToCranedHostname.contains(crane_addr4)) {
+      CRANE_TRACE(
+          "Receive QueryTaskIdFromPortForward from Pam module: "
+          "ssh_remote_port: {}, ssh_remote_address: {}. "
+          "This ssh comes from a CraneD node. uid: {}",
+          request->ssh_remote_port(), request->ssh_remote_address(),
+          request->uid());
+      // In the addresses of CraneD nodes. This ssh request comes from a
+      // CraneD node. Check if the remote port belongs to a task. If so, move
+      // it in to the cgroup of this task.
+      crane_port = g_config.ListenConf.CranedListenPort;
+      remote_is_craned = true;
+    }
+  } else if (ip_ver == 6 && crane::StrToIpv6(crane_addr, &crane_addr6)) {
+    if (g_config.Ipv6ToCranedHostname.contains(crane_addr6)) {
+      CRANE_TRACE(
+          "Receive QueryTaskIdFromPortForward from Pam module: "
+          "ssh_remote_port: {}, ssh_remote_address: {}. "
+          "This ssh comes from a CraneD node. uid: {}",
+          request->ssh_remote_port(), request->ssh_remote_address(),
+          request->uid());
+      crane_port = g_config.ListenConf.CranedListenPort;
+      remote_is_craned = true;
+    }
   } else {
+    CRANE_ERROR(
+        "Unknown ip version for address {} or error converting ip to uint",
+        crane_addr);
+    response->set_ok(false);
+    return Status::OK;
+  }
+
+  if (!remote_is_craned) {
     // Not in the addresses of CraneD nodes. This ssh request comes from a user.
     // Check if the user's uid is running a task. If so, move it in to the
     // cgroup of his first task. If not so, reject this ssh request.
@@ -545,42 +273,32 @@ grpc::Status CranedServiceImpl::QueryTaskIdFromPortForward(
         request->uid());
 
     response->set_from_user(true);
-    crane_service_port = kCforedDefaultPort;
+    crane_port = kCforedDefaultPort;
   }
 
   std::shared_ptr<Channel> channel_of_remote_service;
   if (g_config.ListenConf.UseTls) {
     std::string remote_hostname;
-    ok = crane::ResolveHostnameFromIpv4(request->ssh_remote_address(),
-                                        &remote_hostname);
+    if (ip_ver == 4) {
+      ok = crane::ResolveHostnameFromIpv4(crane_addr4, &remote_hostname);
+    } else {
+      CRANE_ASSERT(ip_ver == 6);
+      ok = crane::ResolveHostnameFromIpv6(crane_addr6, &remote_hostname);
+    }
+
     if (ok) {
       CRANE_TRACE("Remote address {} was resolved as {}",
                   request->ssh_remote_address(), remote_hostname);
 
-      std::string target_service =
-          fmt::format("{}.{}:{}", remote_hostname,
-                      g_config.ListenConf.DomainSuffix, crane_service_port);
-
-      grpc::SslCredentialsOptions ssl_opts;
-      // pem_root_certs is actually the certificate of server side rather than
-      // CA certificate. CA certificate is not needed.
-      // Since we use the same cert/key pair for both cranectld/craned,
-      // pem_root_certs is set to the same certificate.
-      ssl_opts.pem_root_certs = g_config.ListenConf.ServerCertContent;
-      ssl_opts.pem_cert_chain = g_config.ListenConf.ServerCertContent;
-      ssl_opts.pem_private_key = g_config.ListenConf.ServerKeyContent;
-
-      channel_of_remote_service =
-          grpc::CreateChannel(target_service, grpc::SslCredentials(ssl_opts));
+      channel_of_remote_service = CreateTcpTlsChannelByHostname(
+          remote_hostname, crane_port, g_config.ListenConf.TlsCerts);
     } else {
       CRANE_ERROR("Failed to resolve remote address {}.",
                   request->ssh_remote_address());
     }
   } else {
-    std::string target_service =
-        fmt::format("{}:{}", request->ssh_remote_address(), crane_service_port);
     channel_of_remote_service =
-        grpc::CreateChannel(target_service, grpc::InsecureChannelCredentials());
+        CreateTcpInsecureChannel(crane_addr, crane_port);
   }
 
   if (!channel_of_remote_service) {
@@ -624,11 +342,10 @@ grpc::Status CranedServiceImpl::QueryTaskIdFromPortForward(
         "ssh client with remote port {} belongs to task #{}. "
         "Moving this ssh session process into the task's cgroup",
         request->ssh_remote_port(), reply_from_remote_service.task_id());
-
     return Status::OK;
   } else {
     TaskInfoOfUid info{};
-    ok = g_task_mgr->QueryTaskInfoOfUidAsync(request->uid(), &info);
+    ok = g_cg_mgr->QueryTaskInfoOfUidAsync(request->uid(), &info);
     if (ok) {
       CRANE_TRACE(
           "Found a task #{} belonging to uid {}. "
@@ -656,7 +373,7 @@ grpc::Status CranedServiceImpl::MigrateSshProcToCgroup(
   CRANE_TRACE("Moving pid {} to cgroup of task #{}", request->pid(),
               request->task_id());
   bool ok =
-      g_task_mgr->MigrateProcToCgroupOfTask(request->pid(), request->task_id());
+      g_cg_mgr->MigrateProcToCgroupOfTask(request->pid(), request->task_id());
 
   if (!ok) {
     CRANE_INFO("GrpcMigrateSshProcToCgroup failed on pid: {}, task #{}",
@@ -664,6 +381,92 @@ grpc::Status CranedServiceImpl::MigrateSshProcToCgroup(
     response->set_ok(false);
   } else {
     response->set_ok(true);
+  }
+
+  return Status::OK;
+}
+
+Status CranedServiceImpl::QueryTaskEnvVariables(
+    grpc::ServerContext *context,
+    const ::crane::grpc::QueryTaskEnvVariablesRequest *request,
+    crane::grpc::QueryTaskEnvVariablesReply *response) {
+  auto task_env =
+      g_task_mgr->QueryTaskEnvironmentVariablesAsync(request->task_id());
+  if (task_env.has_value()) {
+    for (const auto &[name, value] : task_env.value()) {
+      response->add_name(name);
+      response->add_value(value);
+    }
+    response->set_ok(true);
+  } else {
+    response->set_ok(false);
+  }
+  return Status::OK;
+}
+
+grpc::Status CranedServiceImpl::QueryTaskEnvVariablesForward(
+    grpc::ServerContext *context,
+    const crane::grpc::QueryTaskEnvVariablesForwardRequest *request,
+    crane::grpc::QueryTaskEnvVariablesForwardReply *response) {
+  // First query local device related env list
+  std::vector<EnvPair> dev_envs =
+      g_cg_mgr->GetResourceEnvListOfTask(request->task_id());
+  for (const auto &env : dev_envs) {
+    response->add_name(env.first);
+    response->add_value(env.second);
+  }
+
+  std::optional execution_node_opt =
+      g_cg_mgr->QueryTaskExecutionNode(request->task_id());
+  if (!execution_node_opt.has_value()) {
+    response->set_ok(false);
+    return Status::OK;
+  }
+
+  std::string execution_node = execution_node_opt.value();
+  if (!g_config.CranedRes.contains(execution_node)) {
+    response->set_ok(false);
+    return Status::OK;
+  }
+
+  std::shared_ptr<Channel> channel_of_remote_service;
+  if (g_config.ListenConf.UseTls)
+    channel_of_remote_service = CreateTcpTlsChannelByHostname(
+        execution_node, g_config.ListenConf.CranedListenPort,
+        g_config.ListenConf.TlsCerts);
+  else
+    channel_of_remote_service = CreateTcpInsecureChannel(
+        execution_node, g_config.ListenConf.CranedListenPort);
+
+  if (!channel_of_remote_service) {
+    CRANE_ERROR("Failed to create channel to {}.", execution_node);
+    response->set_ok(false);
+    return Status::OK;
+  }
+
+  crane::grpc::QueryTaskEnvVariablesRequest request_to_remote_service;
+  crane::grpc::QueryTaskEnvVariablesReply reply_from_remote_service;
+  ClientContext context_of_remote_service;
+  Status status_remote_service;
+
+  request_to_remote_service.set_task_id(request->task_id());
+  std::unique_ptr<crane::grpc::Craned::Stub> stub_of_remote_craned =
+      crane::grpc::Craned::NewStub(channel_of_remote_service);
+  status_remote_service = stub_of_remote_craned->QueryTaskEnvVariables(
+      &context_of_remote_service, request_to_remote_service,
+      &reply_from_remote_service);
+  if (!status_remote_service.ok() || !reply_from_remote_service.ok()) {
+    CRANE_WARN(
+        "QueryTaskEnvVariables gRPC call failed: {}. Remote is craned: {}",
+        status_remote_service.error_message(), execution_node);
+    response->set_ok(false);
+    return Status::OK;
+  }
+
+  response->set_ok(true);
+  for (int i = 0; i < reply_from_remote_service.name_size(); i++) {
+    response->add_name(reply_from_remote_service.name(i));
+    response->add_value(reply_from_remote_service.value(i));
   }
 
   return Status::OK;
@@ -693,59 +496,63 @@ grpc::Status CranedServiceImpl::ChangeTaskTimeLimit(
   return Status::OK;
 }
 
+grpc::Status CranedServiceImpl::QueryCranedRemoteMeta(
+    grpc::ServerContext *context,
+    const ::crane::grpc::QueryCranedRemoteMetaRequest *request,
+    crane::grpc::QueryCranedRemoteMetaReply *response) {
+  auto *grpc_meta = response->mutable_craned_remote_meta();
+
+  auto &dres = g_config.CranedRes[g_config.CranedIdOfThisNode]->dedicated_res;
+  grpc_meta->mutable_dres_in_node()->CopyFrom(
+      static_cast<crane::grpc::DedicatedResourceInNode>(dres));
+
+  grpc_meta->set_craned_version(CRANE_VERSION_STRING);
+
+  const SystemRelInfo &sys_info = g_config.CranedMeta.SysInfo;
+  auto *grpc_sys_rel_info = grpc_meta->mutable_sys_rel_info();
+  grpc_sys_rel_info->set_name(sys_info.name);
+  grpc_sys_rel_info->set_release(sys_info.release);
+  grpc_sys_rel_info->set_version(sys_info.version);
+
+  grpc_meta->mutable_craned_start_time()->set_seconds(
+      ToUnixSeconds(g_config.CranedMeta.CranedStartTime));
+  grpc_meta->mutable_system_boot_time()->set_seconds(
+      ToUnixSeconds(g_config.CranedMeta.SystemBootTime));
+
+  response->set_ok(true);
+  return Status::OK;
+}
+
 CranedServer::CranedServer(const Config::CranedListenConf &listen_conf) {
   m_service_impl_ = std::make_unique<CranedServiceImpl>();
 
   grpc::ServerBuilder builder;
-  builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA,
-                             0 /*no limit*/);
-  builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS,
-                             1 /*true*/);
-  builder.AddChannelArgument(
-      GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
-      kCranedGrpcServerPingRecvMinIntervalSec * 1000 /*ms*/);
-  builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PING_STRIKES,
-                             0 /* unlimited */);
+  ServerBuilderSetKeepAliveArgs(&builder);
+  ServerBuilderAddUnixInsecureListeningPort(&builder,
+                                            listen_conf.UnixSocketListenAddr);
 
-  if (g_config.CompressedRpc)
-    builder.SetDefaultCompressionAlgorithm(GRPC_COMPRESS_GZIP);
+  if (g_config.CompressedRpc) ServerBuilderSetCompression(&builder);
 
-  builder.AddListeningPort(listen_conf.UnixSocketListenAddr,
-                           grpc::InsecureServerCredentials());
-
-  std::string listen_addr_port = fmt::format(
-      "{}:{}", listen_conf.CranedListenAddr, listen_conf.CranedListenPort);
+  std::string craned_listen_addr = listen_conf.CranedListenAddr;
   if (listen_conf.UseTls) {
-    grpc::SslServerCredentialsOptions::PemKeyCertPair pem_key_cert_pair;
-    pem_key_cert_pair.cert_chain = listen_conf.ServerCertContent;
-    pem_key_cert_pair.private_key = listen_conf.ServerKeyContent;
-
-    grpc::SslServerCredentialsOptions ssl_opts;
-    // pem_root_certs is actually the certificate of server side rather than
-    // CA certificate. CA certificate is not needed.
-    // Since we use the same cert/key pair for both cranectld/craned,
-    // pem_root_certs is set to the same certificate.
-    ssl_opts.pem_root_certs = listen_conf.ServerCertContent;
-    ssl_opts.pem_key_cert_pairs.emplace_back(std::move(pem_key_cert_pair));
-    ssl_opts.client_certificate_request =
-        GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-
-    builder.AddListeningPort(listen_addr_port,
-                             grpc::SslServerCredentials(ssl_opts));
+    ServerBuilderAddTcpTlsListeningPort(&builder, craned_listen_addr,
+                                        listen_conf.CranedListenPort,
+                                        listen_conf.TlsCerts);
   } else {
-    builder.AddListeningPort(listen_addr_port,
-                             grpc::InsecureServerCredentials());
+    ServerBuilderAddTcpInsecureListeningPort(&builder, craned_listen_addr,
+                                             listen_conf.CranedListenPort);
   }
 
   builder.RegisterService(m_service_impl_.get());
 
   m_server_ = builder.BuildAndStart();
-  CRANE_INFO("Craned is listening on [{}, {}]",
-             listen_conf.UnixSocketListenAddr, listen_addr_port);
+  CRANE_INFO("Craned is listening on [{}, {}:{}]",
+             listen_conf.UnixSocketListenAddr, craned_listen_addr,
+             listen_conf.CranedListenPort);
 
   g_task_mgr->SetSigintCallback([p_server = m_server_.get()] {
     p_server->Shutdown();
-    CRANE_TRACE("Grpc Server Shutdown() was called.");
+    CRANE_INFO("Grpc Server Shutdown() was called.");
   });
 }
 

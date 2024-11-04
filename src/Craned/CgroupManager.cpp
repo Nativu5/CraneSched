@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 /*
@@ -19,19 +21,21 @@
  *
  */
 
-#include "cgroup.linux.h"
+#include "CgroupManager.h"
 
-#include <csignal>
-#include <fstream>
+#include "CranedPublicDefs.h"
+#include "DeviceManager.h"
+#include "crane/PluginClient.h"
+#include "crane/String.h"
 
-namespace util {
+namespace Craned {
 
 /*
  * Initialize libcgroup and mount the controllers Condor will use (if possible)
  *
  * Returns 0 on success, -1 otherwise.
  */
-int CgroupUtil::Init() {
+int CgroupManager::Init() {
   // Initialize library and data structures
   CRANE_DEBUG("Initializing cgroup library.");
   cgroup_init();
@@ -114,7 +118,17 @@ int CgroupUtil::Init() {
     return -1;
   }
 
+  RmAllTaskCgroups_();
+
   return 0;
+}
+
+void CgroupManager::RmAllTaskCgroups_() {
+  RmAllTaskCgroupsUnderController_(CgroupConstant::Controller::CPU_CONTROLLER);
+  RmAllTaskCgroupsUnderController_(
+      CgroupConstant::Controller::MEMORY_CONTROLLER);
+  RmAllTaskCgroupsUnderController_(
+      CgroupConstant::Controller::DEVICES_CONTROLLER);
 }
 
 /*
@@ -123,9 +137,10 @@ int CgroupUtil::Init() {
  * Not designed for external users - extracted from CgroupManager::create to
  * reduce code duplication.
  */
-int CgroupUtil::initialize_controller(
-    struct cgroup &cgroup, const CgroupConstant::Controller controller,
-    const bool required, const bool has_cgroup, bool &changed_cgroup) {
+int CgroupManager::InitializeController_(struct cgroup &cgroup,
+                                         CgroupConstant::Controller controller,
+                                         bool required, bool has_cgroup,
+                                         bool &changed_cgroup) {
   std::string_view controller_str =
       CgroupConstant::GetControllerStringView(controller);
 
@@ -167,6 +182,10 @@ int CgroupUtil::initialize_controller(
   return 0;
 }
 
+std::string CgroupManager::CgroupStrByTaskId_(task_id_t task_id) {
+  return fmt::format("Crane_Task_{}", task_id);
+}
+
 /*
  * Create a new cgroup.
  * Parameters:
@@ -178,7 +197,7 @@ int CgroupUtil::initialize_controller(
  *   - -1 on error
  * On failure, the state of cgroup is undefined.
  */
-std::unique_ptr<Cgroup> CgroupUtil::CreateOrOpen(
+std::unique_ptr<Cgroup> CgroupManager::CreateOrOpen_(
     const std::string &cgroup_string, ControllerFlags preferred_controllers,
     ControllerFlags required_controllers, bool retrieve) {
   using CgroupConstant::Controller;
@@ -209,14 +228,14 @@ std::unique_ptr<Cgroup> CgroupUtil::CreateOrOpen(
   //    return nullptr;
   //  }
   if ((preferred_controllers & Controller::MEMORY_CONTROLLER) &&
-      initialize_controller(
+      InitializeController_(
           *native_cgroup, Controller::MEMORY_CONTROLLER,
           required_controllers & Controller::MEMORY_CONTROLLER, has_cgroup,
           changed_cgroup)) {
     return nullptr;
   }
   if ((preferred_controllers & Controller::FREEZE_CONTROLLER) &&
-      initialize_controller(
+      InitializeController_(
           *native_cgroup, Controller::FREEZE_CONTROLLER,
           required_controllers & Controller::FREEZE_CONTROLLER, has_cgroup,
           changed_cgroup)) {
@@ -230,18 +249,18 @@ std::unique_ptr<Cgroup> CgroupUtil::CreateOrOpen(
   //    return nullptr;
   //  }
   if ((preferred_controllers & Controller::CPU_CONTROLLER) &&
-      initialize_controller(*native_cgroup, Controller::CPU_CONTROLLER,
+      InitializeController_(*native_cgroup, Controller::CPU_CONTROLLER,
                             required_controllers & Controller::CPU_CONTROLLER,
                             has_cgroup, changed_cgroup)) {
     return nullptr;
   }
-  //  if ((preferred_controllers & Controller::DEVICES_CONTROLLER) &&
-  //      initialize_controller(
-  //          *native_cgroup, Controller::DEVICES_CONTROLLER,
-  //          required_controllers & Controller::DEVICES_CONTROLLER, has_cgroup,
-  //          changed_cgroup)) {
-  //    return nullptr;
-  //  }
+  if ((preferred_controllers & Controller::DEVICES_CONTROLLER) &&
+      InitializeController_(
+          *native_cgroup, Controller::DEVICES_CONTROLLER,
+          required_controllers & Controller::DEVICES_CONTROLLER, has_cgroup,
+          changed_cgroup)) {
+    return nullptr;
+  }
 
   int err;
   if (!has_cgroup) {
@@ -260,6 +279,267 @@ std::unique_ptr<Cgroup> CgroupUtil::CreateOrOpen(
   }
 
   return std::make_unique<Cgroup>(cgroup_string, native_cgroup);
+}
+
+bool CgroupManager::CheckIfCgroupForTasksExists(task_id_t task_id) {
+  return m_task_id_to_cg_map_.Contains(task_id);
+}
+
+bool CgroupManager::AllocateAndGetCgroup(task_id_t task_id, Cgroup **cg) {
+  crane::grpc::ResourceInNode res;
+  Cgroup *pcg;
+
+  {
+    auto cg_spec_it = m_task_id_to_cg_spec_map_[task_id];
+    if (!cg_spec_it) return false;
+    res = cg_spec_it->res_in_node;
+  }
+
+  {
+    auto cg_it = m_task_id_to_cg_map_[task_id];
+    auto &cg_unique_ptr = *cg_it;
+    if (!cg_unique_ptr)
+      cg_unique_ptr = CgroupManager::CreateOrOpen_(
+          CgroupStrByTaskId_(task_id),
+          NO_CONTROLLER_FLAG | CgroupConstant::Controller::CPU_CONTROLLER |
+              CgroupConstant::Controller::MEMORY_CONTROLLER |
+              CgroupConstant::Controller::DEVICES_CONTROLLER,
+          NO_CONTROLLER_FLAG, false);
+
+    if (!cg_unique_ptr) return false;
+
+    pcg = cg_unique_ptr.get();
+    if (cg) *cg = pcg;
+  }
+
+  // JobMonitorHook
+  if (g_config.Plugin.Enabled) {
+    g_plugin_client->JobMonitorHookAsync(task_id, pcg->GetCgroupString());
+  }
+
+  CRANE_TRACE(
+      "Setting cgroup limit of task #{}. CPU: {:.2f}, Mem: {:.2f} MB Gres: {}.",
+      task_id, res.allocatable_res_in_node().cpu_core_limit(),
+      res.allocatable_res_in_node().memory_limit_bytes() / (1024.0 * 1024.0),
+      util::ReadableGrpcDresInNode(res.dedicated_res_in_node()));
+
+  bool ok = AllocatableResourceAllocator::Allocate(
+      res.allocatable_res_in_node(), pcg);
+  if (ok)
+    ok &=
+        DedicatedResourceAllocator::Allocate(res.dedicated_res_in_node(), pcg);
+  return ok;
+}
+
+bool CgroupManager::CreateCgroups(std::vector<CgroupSpec> &&cg_specs) {
+  std::chrono::steady_clock::time_point begin;
+  std::chrono::steady_clock::time_point end;
+
+  CRANE_DEBUG("Creating cgroups for {} tasks", cg_specs.size());
+
+  begin = std::chrono::steady_clock::now();
+
+  for (int i = 0; i < cg_specs.size(); i++) {
+    uid_t uid = cg_specs[i].uid;
+    task_id_t task_id = cg_specs[i].task_id;
+
+    CRANE_TRACE("Create lazily allocated cgroups for task #{}, uid {}", task_id,
+                uid);
+
+    this->m_task_id_to_cg_spec_map_.Emplace(task_id, std::move(cg_specs[i]));
+
+    this->m_task_id_to_cg_map_.Emplace(task_id, nullptr);
+
+    // Acquire map lock to avoid using [uid]set deleted by ReleaseCgroup
+    // after checking contains(uid)
+    auto uid_task_id_map_ptr =
+        this->m_uid_to_task_ids_map_.GetMapExclusivePtr();
+    if (!uid_task_id_map_ptr->contains(uid))
+      uid_task_id_map_ptr->emplace(uid, absl::flat_hash_set<uint32_t>{task_id});
+    else
+      uid_task_id_map_ptr->at(uid).RawPtr()->emplace(task_id);
+  }
+
+  end = std::chrono::steady_clock::now();
+  CRANE_TRACE("Create cgroups costed {} ms",
+              std::chrono::duration_cast<std::chrono::milliseconds>(end - begin)
+                  .count());
+
+  return true;
+}
+
+bool CgroupManager::ReleaseCgroupByTaskIdOnly(task_id_t task_id) {
+  uid_t uid;
+  {
+    auto vp = this->m_task_id_to_cg_spec_map_.GetValueExclusivePtr(task_id);
+    if (!vp) return false;
+
+    CRANE_DEBUG(
+        "Remove cgroup for task #{} for potential crashes of other craned.",
+        task_id);
+    uid = vp->uid;
+  }
+  return this->ReleaseCgroup(task_id, uid);
+}
+
+bool CgroupManager::ReleaseCgroup(uint32_t task_id, uid_t uid) {
+  if (!this->m_uid_to_task_ids_map_.Contains(uid)) {
+    CRANE_DEBUG(
+        "Trying to release a non-existent cgroup for uid #{}. Ignoring it...",
+        uid);
+    return false;
+  }
+
+  this->m_task_id_to_cg_spec_map_.Erase(task_id);
+
+  {
+    auto uid_task_id_map = this->m_uid_to_task_ids_map_.GetMapExclusivePtr();
+    auto task_id_set_ptr = uid_task_id_map->at(uid).GetExclusivePtr();
+
+    task_id_set_ptr->erase(task_id);
+    if (task_id_set_ptr->empty()) uid_task_id_map->erase(uid);
+  }
+
+  if (!this->m_task_id_to_cg_map_.Contains(task_id)) {
+    CRANE_DEBUG(
+        "Trying to release a non-existent cgroup for task #{}. Ignoring "
+        "it...",
+        task_id);
+
+    return false;
+  } else {
+    // The termination of all processes in a cgroup is a time-consuming work.
+    // Therefore, once we are sure that the cgroup for this task exists, we
+    // let gRPC call return and put the termination work into the thread pool
+    // to avoid blocking the event loop of TaskManager.
+    // Kind of async behavior.
+
+    // avoid deadlock by Erase at next line
+    Cgroup *cgroup = this->m_task_id_to_cg_map_[task_id]->release();
+    this->m_task_id_to_cg_map_.Erase(task_id);
+
+    if (cgroup != nullptr) {
+      g_thread_pool->detach_task([cgroup]() {
+        bool rc;
+        int cnt = 0;
+
+        while (true) {
+          if (cgroup->Empty()) break;
+
+          if (cnt >= 5) {
+            CRANE_ERROR(
+                "Couldn't kill the processes in cgroup {} after {} times. "
+                "Skipping it.",
+                cgroup->GetCgroupString(), cnt);
+            break;
+          }
+
+          cgroup->KillAllProcesses();
+          ++cnt;
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        delete cgroup;
+      });
+    }
+    return true;
+  }
+}
+
+void CgroupManager::RmAllTaskCgroupsUnderController_(
+    CgroupConstant::Controller controller) {
+  void *handle = nullptr;
+  cgroup_file_info info{};
+
+  const char *controller_str =
+      CgroupConstant::GetControllerStringView(controller).data();
+
+  int base_level;
+  int depth = 1;
+  int ret = cgroup_walk_tree_begin(controller_str, "/", depth, &handle, &info,
+                                   &base_level);
+  while (ret == 0) {
+    if (info.type == cgroup_file_type::CGROUP_FILE_TYPE_DIR &&
+        strstr(info.path, CgroupConstant::kTaskCgPathPrefix) != nullptr) {
+      CRANE_DEBUG("Removing remaining task cgroup: {}", info.full_path);
+      int err = rmdir(info.full_path);
+      if (err != 0)
+        CRANE_ERROR("Failed to remove cgroup {}: {}", info.full_path,
+                    strerror(errno));
+    }
+
+    ret = cgroup_walk_tree_next(depth, &handle, &info, base_level);
+  }
+
+  if (handle) cgroup_walk_tree_end(&handle);
+}
+
+bool CgroupManager::QueryTaskInfoOfUidAsync(uid_t uid, TaskInfoOfUid *info) {
+  CRANE_DEBUG("Query task info for uid {}", uid);
+
+  info->job_cnt = 0;
+  info->cgroup_exists = false;
+
+  if (this->m_uid_to_task_ids_map_.Contains(uid)) {
+    auto task_ids = this->m_uid_to_task_ids_map_[uid];
+    info->job_cnt = task_ids->size();
+    info->first_task_id = *task_ids->begin();
+  }
+  return info->job_cnt > 0;
+}
+
+bool CgroupManager::MigrateProcToCgroupOfTask(pid_t pid, task_id_t task_id) {
+  Cgroup *cg;
+  bool ok = AllocateAndGetCgroup(task_id, &cg);
+  if (!ok) return false;
+
+  return cg->MigrateProcIn(pid);
+}
+
+std::optional<std::string> CgroupManager::QueryTaskExecutionNode(
+    task_id_t task_id) {
+  if (!this->m_task_id_to_cg_spec_map_.Contains(task_id)) return std::nullopt;
+  return this->m_task_id_to_cg_spec_map_[task_id]->execution_node;
+}
+
+std::optional<crane::grpc::ResourceInNode> CgroupManager::GetTaskResourceInNode(
+    task_id_t task_id) {
+  std::optional<crane::grpc::ResourceInNode> res;
+
+  auto cg_spec_ptr = this->m_task_id_to_cg_spec_map_[task_id];
+  if (cg_spec_ptr) {
+    res = cg_spec_ptr->res_in_node;
+  }
+
+  return res;
+}
+
+std::vector<EnvPair> CgroupManager::GetResourceEnvListByResInNode(
+    const crane::grpc::ResourceInNode &res_in_node) {
+  std::vector<EnvPair> env_vec = DeviceManager::GetDevEnvListByResInNode(
+      res_in_node.dedicated_res_in_node());
+
+  env_vec.emplace_back(
+      "CRANE_MEM_PER_NODE",
+      std::to_string(
+          res_in_node.allocatable_res_in_node().memory_limit_bytes() /
+          (1024 * 1024)));
+
+  return env_vec;
+}
+
+std::vector<EnvPair> CgroupManager::GetResourceEnvListOfTask(
+    task_id_t task_id) {
+  std::vector<EnvPair> res;
+
+  auto cg_spec_ptr = m_task_id_to_cg_spec_map_[task_id];
+  if (cg_spec_ptr)
+    res = GetResourceEnvListByResInNode(cg_spec_ptr->res_in_node);
+  else
+    CRANE_ERROR("Trying to get resource env list of a non-existent task #{}",
+                task_id);
+
+  return res;
 }
 
 bool Cgroup::MigrateProcIn(pid_t pid) {
@@ -516,7 +796,7 @@ bool Cgroup::SetBlockioWeight(uint64_t weight) {
 bool Cgroup::SetControllerValue(CgroupConstant::Controller controller,
                                 CgroupConstant::ControllerFile controller_file,
                                 uint64_t value) {
-  if (!CgroupUtil::Mounted(controller)) {
+  if (!g_cg_mgr->Mounted(controller)) {
     CRANE_ERROR("Unable to set {} because cgroup {} is not mounted.",
                 CgroupConstant::GetControllerFileStringView(controller_file),
                 CgroupConstant::GetControllerStringView(controller));
@@ -553,7 +833,7 @@ bool Cgroup::SetControllerValue(CgroupConstant::Controller controller,
 bool Cgroup::SetControllerStr(CgroupConstant::Controller controller,
                               CgroupConstant::ControllerFile controller_file,
                               const std::string &str) {
-  if (!CgroupUtil::Mounted(controller)) {
+  if (!g_cg_mgr->Mounted(controller)) {
     CRANE_ERROR("Unable to set {} because cgroup {} is not mounted.\n",
                 CgroupConstant::GetControllerFileStringView(controller_file),
                 CgroupConstant::GetControllerStringView(controller));
@@ -624,6 +904,50 @@ bool Cgroup::ModifyCgroup_(CgroupConstant::ControllerFile controller_file) {
   return true;
 }
 
+bool Cgroup::SetControllerStrs(CgroupConstant::Controller controller,
+                               CgroupConstant::ControllerFile controller_file,
+                               const std::vector<std::string> &strs) {
+  if (!g_cg_mgr->Mounted(controller)) {
+    CRANE_ERROR("Unable to set {} because cgroup {} is not mounted.\n",
+                CgroupConstant::GetControllerFileStringView(controller_file),
+                CgroupConstant::GetControllerStringView(controller));
+    return false;
+  }
+
+  int err;
+
+  struct cgroup_controller *cg_controller;
+
+  if ((cg_controller = cgroup_get_controller(
+           m_cgroup_,
+           CgroupConstant::GetControllerStringView(controller).data())) ==
+      nullptr) {
+    CRANE_WARN("Unable to get cgroup {} controller for {}.\n",
+               CgroupConstant::GetControllerStringView(controller),
+               m_cgroup_path_);
+    return false;
+  }
+  for (const auto &str : strs) {
+    if ((err = cgroup_set_value_string(
+             cg_controller,
+             CgroupConstant::GetControllerFileStringView(controller_file)
+                 .data(),
+             str.c_str()))) {
+      CRANE_WARN("Unable to add string for {}: {} {}\n", m_cgroup_path_, err,
+                 cgroup_strerror(err));
+      return false;
+    }
+    // Commit cgroup modifications.
+    if ((err = cgroup_modify_cgroup(m_cgroup_))) {
+      CRANE_WARN("Unable to commit {} for cgroup {}: {} {}\n",
+                 CgroupConstant::GetControllerFileStringView(controller_file),
+                 m_cgroup_path_, err, cgroup_strerror(err));
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Cgroup::KillAllProcesses() {
   using namespace CgroupConstant::Internal;
 
@@ -675,5 +999,76 @@ bool Cgroup::Empty() {
     return false;
   }
 }
+bool Cgroup::SetDeviceAccess(const std::unordered_set<SlotId> &devices,
+                             bool set_read, bool set_write, bool set_mknod) {
+  std::string op;
+  if (set_read) op += "r";
+  if (set_write) op += "w";
+  if (set_mknod) op += "m";
+  std::vector<std::string> allow_limits;
+  std::vector<std::string> deny_limits;
+  for (const auto &[_, this_device] : Craned::g_this_node_device) {
+    if (devices.contains(this_device->dev_id)) {
+      for (const auto &dev_meta : this_device->device_metas) {
+        allow_limits.emplace_back(fmt::format("{} {}:{} {}", dev_meta.op_type,
+                                              dev_meta.major, dev_meta.minor,
+                                              op));
+      }
+    } else {
+      for (const auto &dev_meta : this_device->device_metas) {
+        deny_limits.emplace_back(fmt::format("{} {}:{} {}", dev_meta.op_type,
+                                             dev_meta.major, dev_meta.minor,
+                                             op));
+      }
+    }
+  }
+  auto ok = true;
+  if (!allow_limits.empty())
+    ok = SetControllerStrs(CgroupConstant::Controller::DEVICES_CONTROLLER,
+                           CgroupConstant::ControllerFile::DEVICES_ALLOW,
+                           allow_limits);
+  if (ok && !deny_limits.empty())
+    ok &= SetControllerStrs(CgroupConstant::Controller::DEVICES_CONTROLLER,
+                            CgroupConstant::ControllerFile::DEVICES_DENY,
+                            deny_limits);
+  return ok;
+}
 
-}  // namespace util
+bool AllocatableResourceAllocator::Allocate(const AllocatableResource &resource,
+                                            Cgroup *cg) {
+  bool ok;
+  ok = cg->SetCpuCoreLimit(static_cast<double>(resource.cpu_count));
+  ok &= cg->SetMemoryLimitBytes(resource.memory_bytes);
+
+  // Depending on the system configuration, the following two options may not
+  // be enabled, so we ignore the result of them.
+  cg->SetMemorySoftLimitBytes(resource.memory_sw_bytes);
+  cg->SetMemorySwLimitBytes(resource.memory_sw_bytes);
+  return ok;
+}
+
+bool AllocatableResourceAllocator::Allocate(
+    const crane::grpc::AllocatableResource &resource, Cgroup *cg) {
+  bool ok;
+  ok = cg->SetCpuCoreLimit(resource.cpu_core_limit());
+  ok &= cg->SetMemoryLimitBytes(resource.memory_limit_bytes());
+
+  // Depending on the system configuration, the following two options may not
+  // be enabled, so we ignore the result of them.
+  cg->SetMemorySoftLimitBytes(resource.memory_sw_limit_bytes());
+  cg->SetMemorySwLimitBytes(resource.memory_sw_limit_bytes());
+  return ok;
+}
+
+bool DedicatedResourceAllocator::Allocate(
+    const crane::grpc::DedicatedResourceInNode &request_resource, Cgroup *cg) {
+  std::unordered_set<std::string> all_request_slots;
+  for (const auto &[_, type_slots_map] : request_resource.name_type_map()) {
+    for (const auto &[__, slots] : type_slots_map.type_slots_map())
+      all_request_slots.insert(slots.slots().cbegin(), slots.slots().cend());
+  };
+
+  if (!cg->SetDeviceAccess(all_request_slots, true, true, true)) return false;
+  return true;
+}
+}  // namespace Craned

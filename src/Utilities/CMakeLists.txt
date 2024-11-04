@@ -1,4 +1,4 @@
 add_subdirectory(AnonymousPipe)
-add_subdirectory(cgroup)
 add_subdirectory(FileLogger)
+add_subdirectory(PluginClient)
 add_subdirectory(PublicHeader)

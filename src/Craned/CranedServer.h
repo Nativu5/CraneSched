@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #pragma once
@@ -36,17 +38,10 @@ using grpc::ServerReaderWriter;
 using grpc::Status;
 
 using crane::grpc::Craned;
-using crane::grpc::SrunXStreamReply;
-using crane::grpc::SrunXStreamRequest;
 
 class CranedServiceImpl : public Craned::Service {
  public:
   CranedServiceImpl() = default;
-
-  [[deprecated]] Status SrunXStream(
-      ServerContext *context,
-      ServerReaderWriter<SrunXStreamReply, SrunXStreamRequest> *stream)
-      override;
 
   grpc::Status ExecuteTask(grpc::ServerContext *context,
                            const crane::grpc::ExecuteTasksRequest *request,
@@ -82,6 +77,16 @@ class CranedServiceImpl : public Craned::Service {
       const crane::grpc::MigrateSshProcToCgroupRequest *request,
       crane::grpc::MigrateSshProcToCgroupReply *response) override;
 
+  grpc::Status QueryTaskEnvVariables(
+      grpc::ServerContext *context,
+      const ::crane::grpc::QueryTaskEnvVariablesRequest *request,
+      crane::grpc::QueryTaskEnvVariablesReply *response) override;
+
+  grpc::Status QueryTaskEnvVariablesForward(
+      grpc::ServerContext *context,
+      const ::crane::grpc::QueryTaskEnvVariablesForwardRequest *request,
+      crane::grpc::QueryTaskEnvVariablesForwardReply *response) override;
+
   grpc::Status CreateCgroupForTasks(
       grpc::ServerContext *context,
       const crane::grpc::CreateCgroupForTasksRequest *request,
@@ -96,6 +101,11 @@ class CranedServiceImpl : public Craned::Service {
       grpc::ServerContext *context,
       const crane::grpc::ChangeTaskTimeLimitRequest *request,
       crane::grpc::ChangeTaskTimeLimitReply *response) override;
+
+  grpc::Status QueryCranedRemoteMeta(
+      grpc::ServerContext *context,
+      const ::crane::grpc::QueryCranedRemoteMetaRequest *request,
+      crane::grpc::QueryCranedRemoteMetaReply *response) override;
 };
 
 class CranedServer {

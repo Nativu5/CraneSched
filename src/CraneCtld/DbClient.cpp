@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "DbClient.h"
@@ -61,7 +63,7 @@ bool MongodbClient::CheckDefaultRootAccountUserAndInit_() {
         std::numeric_limits<decltype(qos.max_jobs_per_user)>::max();
     qos.max_running_tasks_per_user =
         std::numeric_limits<decltype(qos.max_running_tasks_per_user)>::max();
-    qos.max_time_limit_per_task = absl::Seconds(kMaxTimeLimitSecond);
+    qos.max_time_limit_per_task = absl::Seconds(kTaskMaxTimeLimitSec);
     qos.max_cpus_per_user =
         std::numeric_limits<decltype(qos.max_cpus_per_user)>::max();
     qos.max_cpus_per_account =
@@ -96,7 +98,7 @@ bool MongodbClient::CheckDefaultRootAccountUserAndInit_() {
 
     root_user.name = "root";
     root_user.default_account = "ROOT";
-    root_user.admin_level = User::Admin;
+    root_user.admin_level = User::Root;
     root_user.uid = 0;
     root_user.account_to_attrs_map[root_user.default_account] =
         User::AttrsInAccount{User::PartToAllowedQosMap{}, false};
@@ -161,21 +163,138 @@ bool MongodbClient::InsertJobs(const std::vector<TaskInCtld*>& tasks) {
 }
 
 bool MongodbClient::FetchJobRecords(
-    std::vector<std::unique_ptr<TaskInDb>>* task_list, size_t limit,
-    bool reverse) {
-  mongocxx::options::find option;
-  if (limit > 0) {
-    option = option.limit(limit);
+    const crane::grpc::QueryTasksInfoRequest* request,
+    crane::grpc::QueryTasksInfoReply* response, size_t limit) {
+  auto* task_list = response->mutable_task_info_list();
+
+  document filter;
+
+  bool has_submit_time_interval = request->has_filter_submit_time_interval();
+  if (has_submit_time_interval) {
+    const auto& interval = request->filter_submit_time_interval();
+    filter.append(kvp("time_submit", [&interval](sub_document time_submit_doc) {
+      if (interval.has_lower_bound()) {
+        time_submit_doc.append(kvp("$gte", interval.lower_bound().seconds()));
+      }
+      if (interval.has_upper_bound()) {
+        time_submit_doc.append(kvp("$lte", interval.upper_bound().seconds()));
+      }
+    }));
   }
 
-  document doc;
-  if (reverse) {
-    doc.append(kvp("task_db_id", -1));
-    option = option.sort(doc.view());
+  bool has_start_time_interval = request->has_filter_start_time_interval();
+  if (has_start_time_interval) {
+    const auto& interval = request->filter_start_time_interval();
+    filter.append(kvp("time_start", [&interval](sub_document time_start_doc) {
+      if (interval.has_lower_bound()) {
+        time_start_doc.append(kvp("$gte", interval.lower_bound().seconds()));
+      }
+      if (interval.has_upper_bound()) {
+        time_start_doc.append(kvp("$lte", interval.upper_bound().seconds()));
+      }
+    }));
   }
+
+  bool has_end_time_interval = request->has_filter_end_time_interval();
+  if (has_end_time_interval) {
+    const auto& interval = request->filter_end_time_interval();
+    filter.append(kvp("time_end", [&interval](sub_document time_end_doc) {
+      if (interval.has_lower_bound()) {
+        time_end_doc.append(kvp("$gte", interval.lower_bound().seconds()));
+      }
+      if (interval.has_upper_bound()) {
+        time_end_doc.append(kvp("$lte", interval.upper_bound().seconds()));
+      }
+    }));
+  }
+
+  bool has_accounts_constraint = !request->filter_accounts().empty();
+  if (has_accounts_constraint) {
+    filter.append(kvp("account", [&request](sub_document account_doc) {
+      array account_array;
+      for (const auto& account : request->filter_accounts()) {
+        account_array.append(account);
+      }
+      account_doc.append(kvp("$in", account_array));
+    }));
+  }
+
+  bool has_users_constraint = !request->filter_users().empty();
+  if (has_users_constraint) {
+    filter.append(kvp("username", [&request](sub_document user_doc) {
+      array user_array;
+      for (const auto& user : request->filter_users()) {
+        user_array.append(user);
+      }
+      user_doc.append(kvp("$in", user_array));
+    }));
+  }
+
+  bool has_task_names_constraint = !request->filter_task_names().empty();
+  if (has_task_names_constraint) {
+    filter.append(kvp("task_name", [&request](sub_document task_name_doc) {
+      array task_name_array;
+      for (const auto& task_name : request->filter_task_names()) {
+        task_name_array.append(task_name);
+      }
+      task_name_doc.append(kvp("$in", task_name_array));
+    }));
+  }
+
+  bool has_qos_constraint = !request->filter_qos().empty();
+  if (has_qos_constraint) {
+    filter.append(kvp("qos", [&request](sub_document qos_doc) {
+      array qos_array;
+      for (const auto& qos : request->filter_qos()) {
+        qos_array.append(qos);
+      }
+      qos_doc.append(kvp("$in", qos_array));
+    }));
+  }
+
+  bool has_partitions_constraint = !request->filter_partitions().empty();
+  if (has_partitions_constraint) {
+    filter.append(kvp("partition_name", [&request](sub_document partition_doc) {
+      array partition_array;
+      for (const auto& partition : request->filter_partitions()) {
+        partition_array.append(partition);
+      }
+      partition_doc.append(kvp("$in", partition_array));
+    }));
+  }
+
+  bool has_task_ids_constraint = !request->filter_task_ids().empty();
+  if (has_task_ids_constraint) {
+    filter.append(kvp("task_id", [&request](sub_document task_id_doc) {
+      array task_id_array;
+      for (const auto& task_id : request->filter_task_ids()) {
+        task_id_array.append(static_cast<std::int32_t>(task_id));
+      }
+      task_id_doc.append(kvp("$in", task_id_array));
+    }));
+  }
+
+  bool has_task_status_constraint = !request->filter_task_states().empty();
+  if (has_task_status_constraint) {
+    filter.append(kvp("state", [&request](sub_document state_doc) {
+      array state_array;
+      for (const auto& state : request->filter_task_states()) {
+        state_array.append(state);
+      }
+      state_doc.append(kvp("$in", state_array));
+    }));
+  }
+
+  mongocxx::options::find option;
+  option = option.limit(limit);
+
+  document sort_doc;
+  sort_doc.append(kvp("task_db_id", -1));
+  option = option.sort(sort_doc.view());
 
   mongocxx::cursor cursor =
-      (*GetClient_())[m_db_name_][m_task_collection_name_].find({}, option);
+      (*GetClient_())[m_db_name_][m_task_collection_name_].find(filter.view(),
+                                                                option);
 
   // 0  task_id       task_db_id     mod_time       deleted       account
   // 5  cpus_req      mem_req        task_name      env           id_user
@@ -183,49 +302,54 @@ bool MongodbClient::FetchJobRecords(
   // 15 priority      time_eligible  time_start    time_end    time_suspended
   // 20 script        state          timelimit     time_submit work_dir
   // 25 submit_line   exit_code      username       qos        get_user_env
+  // 30 type          extra_attr
 
   try {
     for (auto view : cursor) {
-      auto task = std::make_unique<TaskInDb>();
+      auto* task = task_list->Add();
 
-      task->task_id = view["task_id"].get_int32().value;
+      task->set_task_id(view["task_id"].get_int32().value);
 
-      task->node_num = view["nodes_alloc"].get_int32().value;
+      task->set_node_num(view["nodes_alloc"].get_int32().value);
 
-      task->account = view["account"].get_string().value.data();
-      task->username = view["username"].get_string().value.data();
+      task->set_account(view["account"].get_string().value.data());
+      task->set_username(view["username"].get_string().value.data());
 
-      task->resources.allocatable_resource.cpu_count =
-          cpu_t{view["cpus_req"].get_double().value};
-      task->resources.allocatable_resource.memory_bytes =
-          task->resources.allocatable_resource.memory_sw_bytes =
-              view["mem_req"].get_int64().value;
-      task->name = view["task_name"].get_string().value;
-      task->qos = view["qos"].get_string().value;
-      task->uid = view["id_user"].get_int32().value;
-      task->gid = view["id_group"].get_int32().value;
-      task->allocated_craneds_regex =
-          view["nodelist"].get_string().value.data();
-      task->partition_id = view["partition_name"].get_string().value;
-      task->SetStartTimeByUnixSecond(view["time_start"].get_int64().value);
-      task->SetEndTimeByUnixSecond(view["time_end"].get_int64().value);
+      auto* mutable_res_view = task->mutable_res_view();
+      auto* mutable_alloc_res = mutable_res_view->mutable_allocatable_res();
+      mutable_alloc_res->set_cpu_core_limit(
+          view["cpus_req"].get_double().value);
+      mutable_alloc_res->set_memory_limit_bytes(
+          view["mem_req"].get_int64().value);
+      mutable_alloc_res->set_memory_sw_limit_bytes(
+          view["mem_req"].get_int64().value);
 
-      task->status =
-          static_cast<crane::grpc::TaskStatus>(view["state"].get_int32().value);
-      task->time_limit = absl::Seconds(view["timelimit"].get_int64().value);
-      task->SetSubmitTimeByUnixSecond(view["time_submit"].get_int64().value);
-      task->cwd = view["work_dir"].get_string().value;
+      task->set_name(std::string(view["task_name"].get_string().value));
+      task->set_qos(std::string(view["qos"].get_string().value));
+      task->set_uid(view["id_user"].get_int32().value);
+      task->set_gid(view["id_group"].get_int32().value);
+      task->set_craned_list(view["nodelist"].get_string().value.data());
+      task->set_partition(
+          std::string(view["partition_name"].get_string().value));
+
+      task->mutable_start_time()->set_seconds(
+          view["time_start"].get_int64().value);
+      task->mutable_end_time()->set_seconds(view["time_end"].get_int64().value);
+
+      task->set_status(static_cast<crane::grpc::TaskStatus>(
+          view["state"].get_int32().value));
+      task->mutable_time_limit()->set_seconds(
+          view["timelimit"].get_int64().value);
+      task->mutable_submit_time()->set_seconds(
+          view["time_submit"].get_int64().value);
+      task->set_cwd(std::string(view["work_dir"].get_string().value));
       if (view["submit_line"])
-        task->cmd_line = view["submit_line"].get_string().value;
-      task->exit_code = view["exit_code"].get_int32().value;
+        task->set_cmd_line(std::string(view["submit_line"].get_string().value));
+      task->set_exit_code(view["exit_code"].get_int32().value);
 
-      // Todo: As for now, only Batch type is implemented and some data
-      // resolving
-      //  is hardcoded. Hard-coding for Batch task will be resolved when
-      //  Interactive task is implemented.
-      task->type = crane::grpc::Batch;
+      task->set_type((crane::grpc::TaskType)view["type"].get_int32().value);
 
-      task_list->emplace_back(std::move(task));
+      task->set_extra_attr(view["extra_attr"].get_string().value.data());
     }
   } catch (const bsoncxx::exception& e) {
     PrintError_(e.what());
@@ -294,15 +418,15 @@ bool MongodbClient::DeleteEntity(const MongodbClient::EntityType type,
   std::string_view coll;
 
   switch (type) {
-    case EntityType::ACCOUNT:
-      coll = m_account_collection_name_;
-      break;
-    case EntityType::USER:
-      coll = m_user_collection_name_;
-      break;
-    case EntityType::QOS:
-      coll = m_qos_collection_name_;
-      break;
+  case EntityType::ACCOUNT:
+    coll = m_account_collection_name_;
+    break;
+  case EntityType::USER:
+    coll = m_user_collection_name_;
+    break;
+  case EntityType::QOS:
+    coll = m_qos_collection_name_;
+    break;
   }
   document filter;
   filter.append(kvp("name", name));
@@ -641,15 +765,19 @@ bsoncxx::builder::basic::document MongodbClient::AccountToDocument_(
 void MongodbClient::ViewToQos_(const bsoncxx::document::view& qos_view,
                                Ctld::Qos* qos) {
   try {
-    qos->deleted = qos_view["deleted"].get_bool().value;
-    qos->name = qos_view["name"].get_string().value;
-    qos->description = qos_view["description"].get_string().value;
-    qos->reference_count = qos_view["reference_count"].get_int32().value;
-    qos->priority = qos_view["priority"].get_int64().value;
-    qos->max_jobs_per_user = qos_view["max_jobs_per_user"].get_int64().value;
-    qos->max_cpus_per_user = qos_view["max_cpus_per_user"].get_int64().value;
-    qos->max_time_limit_per_task =
-        absl::Seconds(qos_view["max_time_limit_per_task"].get_int64().value);
+    qos->deleted = qos_view[Qos::FieldStringOfDeleted()].get_bool().value;
+    qos->name = qos_view[Qos::FieldStringOfName()].get_string().value;
+    qos->description =
+        qos_view[Qos::FieldStringOfDescription()].get_string().value;
+    qos->reference_count =
+        qos_view[Qos::FieldStringOfReferenceCount()].get_int32().value;
+    qos->priority = qos_view[Qos::FieldStringOfPriority()].get_int64().value;
+    qos->max_jobs_per_user =
+        qos_view[Qos::FieldStringOfMaxJobsPerUser()].get_int64().value;
+    qos->max_cpus_per_user =
+        qos_view[Qos::FieldStringOfMaxCpusPerUser()].get_int64().value;
+    qos->max_time_limit_per_task = absl::Seconds(
+        qos_view[Qos::FieldStringOfMaxTimeLimitPerTask()].get_int64().value);
   } catch (const bsoncxx::exception& e) {
     PrintError_(e.what());
   }
@@ -658,10 +786,15 @@ void MongodbClient::ViewToQos_(const bsoncxx::document::view& qos_view,
 bsoncxx::builder::basic::document MongodbClient::QosToDocument_(
     const Ctld::Qos& qos) {
   std::array<std::string, 8> fields{
-      "deleted",           "name",
-      "description",       "reference_count",
-      "priority",          "max_jobs_per_user",
-      "max_cpus_per_user", "max_time_limit_per_task"};
+      Qos::FieldStringOfDeleted(),
+      Qos::FieldStringOfName(),
+      Qos::FieldStringOfDescription(),
+      Qos::FieldStringOfReferenceCount(),
+      Qos::FieldStringOfPriority(),
+      Qos::FieldStringOfMaxJobsPerUser(),
+      Qos::FieldStringOfMaxCpusPerUser(),
+      Qos::FieldStringOfMaxTimeLimitPerTask(),
+  };
   std::tuple<bool, std::string, std::string, int, int64_t, int64_t, int64_t,
              int64_t>
       values{false,
@@ -694,54 +827,62 @@ MongodbClient::document MongodbClient::TaskInEmbeddedDbToDocument_(
   // 15 priority      time_eligible  time_start    time_end    time_suspended
   // 20 script        state          timelimit     time_submit work_dir
   // 25 submit_line   exit_code      username       qos        get_user_env
+  // 30 type          extra_attr
 
-  std::array<std::string, 30> fields{
-      "task_id",        "task_db_id",    "mod_time",    "deleted",
-      "account",  // 0 - 4
-      "cpus_req",       "mem_req",       "task_name",   "env",
-      "id_user",  // 5 - 9
-      "id_group",       "nodelist",      "nodes_alloc", "node_inx",
-      "partition_name",  // 10 - 14
-      "priority",       "time_eligible", "time_start",  "time_end",
-      "time_suspended",  // 15 - 19
-      "script",         "state",         "timelimit",   "time_submit",
-      "work_dir",  // 20 - 24
-      "submit_line",    "exit_code",     "username",    "qos",
-      "get_user_env",  // 25 - 29
+  // clang-format off
+  std::array<std::string, 32> fields{
+    // 0 - 4
+    "task_id",  "task_db_id", "mod_time",    "deleted",  "account",
+    // 5 - 9
+    "cpus_req", "mem_req",    "task_name",   "env",      "id_user",
+    // 10 - 14
+    "id_group", "nodelist",   "nodes_alloc", "node_inx", "partition_name",
+    // 15 - 19
+    "priority", "time_eligible", "time_start", "time_end", "time_suspended",
+    // 20 - 24
+    "script", "state", "timelimit", "time_submit", "work_dir",
+    // 25 - 29
+    "submit_line", "exit_code",  "username", "qos", "get_user_env",
+    // 30 - 31
+    "type", "extra_attr", 
   };
+  // clang-format on
 
   std::tuple<int32_t, task_db_id_t, int64_t, bool, std::string,    /*0-4*/
              double, int64_t, std::string, std::string, int32_t,   /*5-9*/
              int32_t, std::string, int32_t, int32_t, std::string,  /*10-14*/
              int64_t, int64_t, int64_t, int64_t, int64_t,          /*15-19*/
              std::string, int32_t, int64_t, int64_t, std::string,  /*20-24*/
-             std::string, int32_t, std::string, std::string, bool> /*25-29*/
-      values{                                                      // 0-4
-             static_cast<int32_t>(runtime_attr.task_id()),
-             runtime_attr.task_db_id(), absl::ToUnixSeconds(absl::Now()), false,
-             task_to_ctld.account(),
-             // 5-9
-             task_to_ctld.resources().allocatable_resource().cpu_core_limit(),
-             static_cast<int64_t>(task_to_ctld.resources()
-                                      .allocatable_resource()
-                                      .memory_limit_bytes()),
-             task_to_ctld.name(), env_str,
-             static_cast<int32_t>(task_to_ctld.uid()),
-             // 10-14
-             static_cast<int32_t>(runtime_attr.gid()),
-             util::HostNameListToStr(runtime_attr.craned_ids()),
-             runtime_attr.craned_ids().size(), 0, task_to_ctld.partition_name(),
-             // 15-19
-             0, 0, runtime_attr.start_time().seconds(),
-             runtime_attr.end_time().seconds(), 0,
-             // 20-24
-             task_to_ctld.batch_meta().sh_script(), runtime_attr.status(),
-             task_to_ctld.time_limit().seconds(),
-             runtime_attr.submit_time().seconds(), task_to_ctld.cwd(),
-             // 25-29
-             task_to_ctld.cmd_line(), runtime_attr.exit_code(),
-             runtime_attr.username(), task_to_ctld.qos(),
-             task_to_ctld.get_user_env()};
+             std::string, int32_t, std::string, std::string, bool, /*25-29*/
+             int32_t, std::string>                                 /*30-31*/
+      values{
+          // 0-4
+          static_cast<int32_t>(runtime_attr.task_id()),
+          runtime_attr.task_db_id(), absl::ToUnixSeconds(absl::Now()), false,
+          task_to_ctld.account(),
+          // 5-9
+          task_to_ctld.resources().allocatable_res().cpu_core_limit(),
+          static_cast<int64_t>(
+              task_to_ctld.resources().allocatable_res().memory_limit_bytes()),
+          task_to_ctld.name(), env_str,
+          static_cast<int32_t>(task_to_ctld.uid()),
+          // 10-14
+          static_cast<int32_t>(runtime_attr.gid()),
+          util::HostNameListToStr(runtime_attr.craned_ids()),
+          runtime_attr.craned_ids().size(), 0, task_to_ctld.partition_name(),
+          // 15-19
+          0, 0, runtime_attr.start_time().seconds(),
+          runtime_attr.end_time().seconds(), 0,
+          // 20-24
+          task_to_ctld.batch_meta().sh_script(), runtime_attr.status(),
+          task_to_ctld.time_limit().seconds(),
+          runtime_attr.submit_time().seconds(), task_to_ctld.cwd(),
+          // 25-29
+          task_to_ctld.cmd_line(), runtime_attr.exit_code(),
+          runtime_attr.username(), task_to_ctld.qos(),
+          task_to_ctld.get_user_env(),
+          // 30-31
+          task_to_ctld.type(), task_to_ctld.extra_attr()};
 
   return DocumentConstructor_(fields, values);
 }
@@ -764,49 +905,55 @@ MongodbClient::document MongodbClient::TaskInCtldToDocument_(TaskInCtld* task) {
   // 15 priority      time_eligible  time_start    time_end    time_suspended
   // 20 script        state          timelimit     time_submit work_dir
   // 25 submit_line   exit_code      username       qos        get_user_env
+  // 30 type          extra_attr
 
-  std::array<std::string, 30> fields{
-      "task_id",        "task_db_id",    "mod_time",    "deleted",
-      "account",  // 0 - 4
-      "cpus_req",       "mem_req",       "task_name",   "env",
-      "id_user",  // 5 - 9
-      "id_group",       "nodelist",      "nodes_alloc", "node_inx",
-      "partition_name",  // 10 - 14
-      "priority",       "time_eligible", "time_start",  "time_end",
-      "time_suspended",  // 15 - 19
-      "script",         "state",         "timelimit",   "time_submit",
-      "work_dir",  // 20 - 24
-      "submit_line",    "exit_code",     "username",    "qos",
-      "get_user_env",  // 25 - 29
+  // clang-format off
+  std::array<std::string, 32> fields{
+      // 0 - 4
+      "task_id",  "task_db_id", "mod_time",    "deleted",  "account",
+      // 5 - 9
+      "cpus_req", "mem_req",    "task_name",   "env",      "id_user",
+      // 10 - 14
+      "id_group", "nodelist",   "nodes_alloc", "node_inx", "partition_name",
+      // 15 - 19
+      "priority", "time_eligible", "time_start", "time_end", "time_suspended",
+      // 20 - 24
+      "script", "state", "timelimit", "time_submit", "work_dir",
+      // 25 - 29
+      "submit_line", "exit_code",  "username", "qos", "get_user_env",
+      // 30 - 31
+      "type", "extra_attr",
   };
+  // clang-format on
 
   std::tuple<int32_t, task_db_id_t, int64_t, bool, std::string,    /*0-4*/
              double, int64_t, std::string, std::string, int32_t,   /*5-9*/
              int32_t, std::string, int32_t, int32_t, std::string,  /*10-14*/
              int64_t, int64_t, int64_t, int64_t, int64_t,          /*15-19*/
              std::string, int32_t, int64_t, int64_t, std::string,  /*20-24*/
-             std::string, int32_t, std::string, std::string, bool> /*25-29*/
-
-      values{
-          // 0-4
-          static_cast<int32_t>(task->TaskId()), task->TaskDbId(),
-          absl::ToUnixSeconds(absl::Now()), false, task->account,
-          // 5-9
-          static_cast<double>(task->resources.allocatable_resource.cpu_count),
-          static_cast<int64_t>(
-              task->resources.allocatable_resource.memory_bytes),
-          task->name, env_str, static_cast<int32_t>(task->uid),
-          // 10-14
-          static_cast<int32_t>(task->Gid()), task->allocated_craneds_regex,
-          static_cast<int32_t>(task->nodes_alloc), 0, task->partition_id,
-          // 15-19
-          0, 0, task->StartTimeInUnixSecond(), task->EndTimeInUnixSecond(), 0,
-          // 20-24
-          script, task->Status(), absl::ToInt64Seconds(task->time_limit),
-          task->SubmitTimeInUnixSecond(), task->cwd,
-          // 25-29
-          task->cmd_line, task->ExitCode(), task->Username(), task->qos,
-          task->get_user_env};
+             std::string, int32_t, std::string, std::string, bool, /*25-29*/
+             int32_t, std::string>                                 /*30-31*/
+      values{                                                      // 0-4
+             static_cast<int32_t>(task->TaskId()), task->TaskDbId(),
+             absl::ToUnixSeconds(absl::Now()), false, task->account,
+             // 5-9
+             static_cast<double>(task->requested_node_res_view.CpuCount()),
+             static_cast<int64_t>(task->requested_node_res_view.MemoryBytes()),
+             task->name, env_str, static_cast<int32_t>(task->uid),
+             // 10-14
+             static_cast<int32_t>(task->Gid()), task->allocated_craneds_regex,
+             static_cast<int32_t>(task->nodes_alloc), 0, task->partition_id,
+             // 15-19
+             0, 0, task->StartTimeInUnixSecond(), task->EndTimeInUnixSecond(),
+             0,
+             // 20-24
+             script, task->Status(), absl::ToInt64Seconds(task->time_limit),
+             task->SubmitTimeInUnixSecond(), task->cwd,
+             // 25-29
+             task->cmd_line, task->ExitCode(), task->Username(), task->qos,
+             task->get_user_env,
+             // 30-31
+             task->type, task->extra_attr};
 
   return DocumentConstructor_(fields, values);
 }

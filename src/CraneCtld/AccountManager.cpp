@@ -1,17 +1,19 @@
 /**
- * Copyright (c) 2023 Peking University and Peking University
+ * Copyright (c) 2024 Peking University and Peking University
  * Changsha Institute for Computing and Digital Economy
  *
- * CraneSched is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of
- * the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS,
- * WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "AccountManager.h"
@@ -45,11 +47,11 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
   }
 
   std::string object_account = new_user.default_account;
-
   const std::string name = new_user.name;
 
   // Avoid duplicate insertion
   const User* find_user = GetUserInfoNoLock_(name);
+  User res_user;
   if (find_user && !find_user->deleted) {
     if (find_user->account_to_attrs_map.contains(object_account)) {
       return Result{false,
@@ -57,12 +59,15 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
                                 object_account)};
     } else {
       // Add account to user's map
-      new_user = *find_user;
-      new_user.account_to_attrs_map[object_account];
+      res_user = *find_user;
+      res_user.account_to_attrs_map[object_account] =
+          new_user.account_to_attrs_map[object_account];
       if (add_coordinator) {
-        new_user.coordinator_accounts.push_back(object_account);
+        res_user.coordinator_accounts.push_back(object_account);
       }
     }
+  } else {
+    res_user = std::move(new_user);
   }
 
   // Check whether the account exists
@@ -73,11 +78,11 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
 
   const std::list<std::string>& parent_allowed_partition =
       find_account->allowed_partition;
-  if (!new_user.account_to_attrs_map[object_account]
+  if (!res_user.account_to_attrs_map[object_account]
            .allowed_partition_qos_map.empty()) {
     // Check if user's allowed partition is a subset of parent's allowed
     // partition
-    for (auto&& [partition, qos] : new_user.account_to_attrs_map[object_account]
+    for (auto&& [partition, qos] : res_user.account_to_attrs_map[object_account]
                                        .allowed_partition_qos_map) {
       if (std::find(parent_allowed_partition.begin(),
                     parent_allowed_partition.end(),
@@ -93,14 +98,14 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
   } else {
     // Inherit
     for (const auto& partition : parent_allowed_partition) {
-      new_user.account_to_attrs_map[object_account]
+      res_user.account_to_attrs_map[object_account]
           .allowed_partition_qos_map[partition] =
           std::pair<std::string, std::list<std::string>>{
               find_account->default_qos,
               std::list<std::string>{find_account->allowed_qos_list}};
     }
   }
-  new_user.account_to_attrs_map[object_account].blocked = false;
+  res_user.account_to_attrs_map[object_account].blocked = false;
 
   mongocxx::client_session::with_transaction_cb callback =
       [&](mongocxx::client_session* session) {
@@ -117,13 +122,13 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
         if (find_user) {
           // There is a same user but was deleted or user would like to add user
           // to a new account,here will overwrite it with the same name
-          g_db_client->UpdateUser(new_user);
+          g_db_client->UpdateUser(res_user);
           g_db_client->UpdateEntityOne(MongodbClient::EntityType::USER, "$set",
                                        name, "creation_time",
                                        ToUnixSeconds(absl::Now()));
         } else {
           // Insert the new user
-          g_db_client->InsertUser(new_user);
+          g_db_client->InsertUser(res_user);
         }
       };
 
@@ -135,7 +140,7 @@ AccountManager::Result AccountManager::AddUser(User&& new_user) {
   if (add_coordinator) {
     m_account_map_[object_account]->coordinators.emplace_back(name);
   }
-  m_user_map_[name] = std::make_unique<User>(std::move(new_user));
+  m_user_map_[name] = std::make_unique<User>(std::move(res_user));
 
   return Result{true};
 }
@@ -553,39 +558,39 @@ AccountManager::Result AccountManager::ModifyUser(
   }
 
   switch (operatorType) {
-    case crane::grpc::ModifyEntityRequest_OperatorType_Add:
-      if (item == "allowed_partition") {
-        return AddUserAllowedPartition_(name, account, value);
-      } else if (item == "allowed_qos_list") {
-        return AddUserAllowedQos_(name, value, account, partition);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be added", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Add:
+    if (item == "allowed_partition") {
+      return AddUserAllowedPartition_(name, account, value);
+    } else if (item == "allowed_qos_list") {
+      return AddUserAllowedQos_(name, value, account, partition);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be added", item)};
+    }
 
-    case crane::grpc::ModifyEntityRequest_OperatorType_Overwrite:
-      if (item == "admin_level") {
-        return SetUserAdminLevel_(name, value);
-      } else if (item == "default_qos") {
-        return SetUserDefaultQos_(name, value, account, partition);
-      } else if (item == "allowed_partition") {
-        return SetUserAllowedPartition_(name, account, value);
-      } else if (item == "allowed_qos_list") {
-        return SetUserAllowedQos_(name, account, partition, value, force);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be set", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Overwrite:
+    if (item == "admin_level") {
+      return SetUserAdminLevel_(name, value);
+    } else if (item == "default_qos") {
+      return SetUserDefaultQos_(name, value, account, partition);
+    } else if (item == "allowed_partition") {
+      return SetUserAllowedPartition_(name, account, value);
+    } else if (item == "allowed_qos_list") {
+      return SetUserAllowedQos_(name, account, partition, value, force);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be set", item)};
+    }
 
-    case crane::grpc::ModifyEntityRequest_OperatorType_Delete:
-      if (item == "allowed_partition") {
-        return DeleteUserAllowedPartition_(name, account, value);
-      } else if (item == "allowed_qos_list") {
-        return DeleteUserAllowedQos_(name, value, account, partition, force);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be deleted", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Delete:
+    if (item == "allowed_partition") {
+      return DeleteUserAllowedPartition_(name, account, value);
+    } else if (item == "allowed_qos_list") {
+      return DeleteUserAllowedQos_(name, value, account, partition, force);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be deleted", item)};
+    }
 
-    default:
-      return Result{false, fmt::format("Unknown field '{}'", item)};
+  default:
+    return Result{false, fmt::format("Unknown field '{}'", item)};
   }
 }
 
@@ -594,45 +599,58 @@ AccountManager::Result AccountManager::ModifyAccount(
     const std::string& name, const std::string& item, const std::string& value,
     bool force) {
   switch (operatorType) {
-    case crane::grpc::ModifyEntityRequest_OperatorType_Add:
-      if (item == "allowed_partition") {
-        return AddAccountAllowedPartition_(name, value);
-      } else if (item == "allowed_qos_list") {
-        return AddAccountAllowedQos_(name, value);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be added", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Add:
+    if (item == "allowed_partition") {
+      return AddAccountAllowedPartition_(name, value);
+    } else if (item == "allowed_qos_list") {
+      return AddAccountAllowedQos_(name, value);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be added", item)};
+    }
 
-    case crane::grpc::ModifyEntityRequest_OperatorType_Overwrite:
-      if (item == "description") {
-        return SetAccountDescription_(name, value);
-      } else if (item == "allowed_partition") {
-        return SetAccountAllowedPartition_(name, value, force);
-      } else if (item == "allowed_qos_list") {
-        return SetAccountAllowedQos_(name, value, force);
-      } else if (item == "default_qos") {
-        return SetAccountDefaultQos_(name, value);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be set", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Overwrite:
+    if (item == "description") {
+      return SetAccountDescription_(name, value);
+    } else if (item == "allowed_partition") {
+      return SetAccountAllowedPartition_(name, value, force);
+    } else if (item == "allowed_qos_list") {
+      return SetAccountAllowedQos_(name, value, force);
+    } else if (item == "default_qos") {
+      return SetAccountDefaultQos_(name, value);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be set", item)};
+    }
 
-    case crane::grpc::ModifyEntityRequest_OperatorType_Delete:
-      if (item == "allowed_partition") {
-        return DeleteAccountAllowedPartition_(name, value, force);
-      } else if (item == "allowed_qos_list") {
-        return DeleteAccountAllowedQos_(name, value, force);
-      } else {
-        return Result{false, fmt::format("Field '{}' can't be deleted", item)};
-      }
+  case crane::grpc::ModifyEntityRequest_OperatorType_Delete:
+    if (item == "allowed_partition") {
+      return DeleteAccountAllowedPartition_(name, value, force);
+    } else if (item == "allowed_qos_list") {
+      return DeleteAccountAllowedQos_(name, value, force);
+    } else {
+      return Result{false, fmt::format("Field '{}' can't be deleted", item)};
+    }
 
-    default:
-      return Result{true};
+  default:
+    return Result{true};
   }
 }
 
 AccountManager::Result AccountManager::ModifyQos(const std::string& name,
                                                  const std::string& item,
                                                  const std::string& value) {
+  bool value_is_number{false};
+  int64_t value_number;
+  if (item != Qos::FieldStringOfDescription()) {
+    bool ok = util::ConvertStringToInt64(value, &value_number);
+    if (!ok) return Result{false, "Failed to convert value to integer"};
+
+    value_is_number = true;
+
+    if (item == Qos::FieldStringOfMaxTimeLimitPerTask() &&
+        !CheckIfTimeLimitSecIsValid(value_number))
+      return Result{false, "Invalid time limit value"};
+  }
+
   util::write_lock_guard qos_guard(m_rw_qos_mutex_);
 
   const Qos* p = GetExistedQosInfoNoLock_(name);
@@ -646,10 +664,9 @@ AccountManager::Result AccountManager::ModifyQos(const std::string& name,
       return Result{false, "Fail to update the database"};
     }
   } else {
-    if (!g_db_client->UpdateEntityOne(
-            MongodbClient::EntityType::QOS, "$set", name, item,
-            std::stol(
-                value) /*uint32 Type Stores data based on long(int64_t)*/)) {
+    /* uint32 Type Stores data based on long(int64_t) */
+    if (!g_db_client->UpdateEntityOne(MongodbClient::EntityType::QOS, "$set",
+                                      name, item, value_number)) {
       return Result{false, "Fail to update the database"};
     }
   }
@@ -797,12 +814,13 @@ result::result<void, std::string> AccountManager::CheckAndApplyQosLimitOnTask(
 
   task->qos_priority = qos_share_ptr->priority;
 
-  if (task->time_limit >= absl::Seconds(kMaxTimeLimitSecond)) {
+  if (task->time_limit >= absl::Seconds(kTaskMaxTimeLimitSec)) {
     task->time_limit = qos_share_ptr->max_time_limit_per_task;
   } else if (task->time_limit > qos_share_ptr->max_time_limit_per_task)
     return result::fail("time-limit reached the user's limit.");
 
-  if (static_cast<double>(task->cpus_per_task) > qos_share_ptr->max_cpus_per_user)
+  if (static_cast<double>(task->cpus_per_task) >
+      qos_share_ptr->max_cpus_per_user)
     return result::fail("cpus-per-task reached the user's limit.");
 
   return {};
@@ -812,17 +830,13 @@ AccountManager::Result AccountManager::FindUserLevelAccountsOfUid(
     uint32_t uid, User::AdminLevel* level, std::list<std::string>* accounts) {
   PasswordEntry entry(uid);
   if (!entry.Valid()) {
-    return Result{false,
-                  fmt::format("Uid {} not found on the controller node", uid)};
+    return Result{false, fmt::format("Uid {} not found.", uid)};
   }
 
   UserMutexSharedPtr ptr = GetExistedUserInfo(entry.Username());
   if (!ptr) {
-    return Result{
-        false,
-        fmt::format(
-            "Permission error: User '{}' not found in the account database",
-            entry.Username())};
+    return Result{false, fmt::format("User {} is not a user of Crane.",
+                                     entry.Username())};
   }
   if (level != nullptr) *level = ptr->admin_level;
   if (accounts != nullptr) {
@@ -838,32 +852,25 @@ result::result<void, std::string> AccountManager::CheckUidIsAdmin(
     uint32_t uid) {
   PasswordEntry entry(uid);
   if (!entry.Valid()) {
-    return result::failure(fmt::format("Uid {} not existed", uid));
+    return result::failure(fmt::format("Uid {} not found.", uid));
   }
 
   util::read_lock_guard user_guard(m_rw_user_mutex_);
   const User* ptr = GetExistedUserInfoNoLock_(entry.Username());
   if (!ptr) {
-    return result::failure(fmt::format(
-        "Parameter error: User '{}' is not a crane user", entry.Username()));
+    return result::failure(
+        fmt::format("User {} is not a user of Crane.", entry.Username()));
   }
 
-  if (ptr->admin_level == User::Operator || ptr->admin_level == User::Admin)
-    return {};
+  if (ptr->admin_level >= User::Operator) return {};
 
-  return result::failure(fmt::format(
-      "Permission error: User '{}' is an ordinary user.", entry.Username()));
+  return result::failure(
+      fmt::format("User {} has insufficient privilege.", entry.Username()));
 }
 
-/**
- * @param uid
- * @param account(when the parameter account is empty, this function can be used
- * as a permission query function)
- * @param level_of_uid
- * @return
- */
 AccountManager::Result AccountManager::HasPermissionToAccount(
-    uint32_t uid, const std::string& account, User::AdminLevel* level_of_uid) {
+    uint32_t uid, const std::string& account, bool read_only_priv,
+    User::AdminLevel* level_of_uid) {
   PasswordEntry entry(uid);
   if (!entry.Valid()) {
     return Result{false, fmt::format("Uid {} not existed", uid)};
@@ -872,78 +879,92 @@ AccountManager::Result AccountManager::HasPermissionToAccount(
   util::read_lock_guard user_guard(m_rw_user_mutex_);
   util::read_lock_guard account_guard(m_rw_account_mutex_);
 
-  const User* ptr = GetExistedUserInfoNoLock_(entry.Username());
-  if (!ptr) {
-    return Result{false,
-                  fmt::format("Parameter error: User '{}' is not a crane user",
-                              entry.Username())};
+  const User* user = GetExistedUserInfoNoLock_(entry.Username());
+  if (!user) {
+    return Result{false, fmt::format("User '{}' is not a user of Crane",
+                                     entry.Username())};
   }
 
-  if (level_of_uid != nullptr) *level_of_uid = ptr->admin_level;
+  if (level_of_uid != nullptr) *level_of_uid = user->admin_level;
 
-  if (ptr->admin_level == User::None) {
-    if (account.empty()) {
-      return Result{
-          false,
-          fmt::format("Permission error: User '{}' don't have the permission",
-                      entry.Username())};
-    } else {
-      for (const auto& acc : ptr->coordinator_accounts) {
-        if (acc == account || PaternityTestNoLock_(acc, account)) {
+  if (user->admin_level == User::None) {
+    if (account.empty())
+      return Result{false, fmt::format("No account is specified for user {}",
+                                       entry.Username())};
+
+    if (read_only_priv) {
+      // In current implementation, if a user is the coordinator of an
+      // account, it must exist in user->account_to_attrs_map.
+      // This is guaranteed by the procedure of adding coordinator, where the
+      // coordinator is specified only when adding a user to an account.
+      // Thus, user->account_to_attrs_map must cover all the accounts he
+      // coordinates, and it's ok to skip checking user->coordinator_accounts.
+      for (const auto& [acc, item] : user->account_to_attrs_map)
+        if (acc == account || PaternityTestNoLock_(acc, account))
           return Result{true};
-        }
-      }
-
-      return Result{
-          false,
-          fmt::format(
-              "Permission error: User '{}' don't have the permission to "
-              "manager account '{}' which not in subtree of its accounts",
-              entry.Username(), account)};
+    } else {
+      for (const auto& acc : user->coordinator_accounts)
+        if (acc == account || PaternityTestNoLock_(acc, account))
+          return Result{true};
     }
+
+    return Result{
+        false,
+        fmt::format("User {} is not allowed to access"
+                    "account {} out of the subtree of his permitted accounts.",
+                    entry.Username(), account)};
   }
+
   return Result{true};
 }
 
 AccountManager::Result AccountManager::HasPermissionToUser(
-    uint32_t uid, const std::string& user, User::AdminLevel* level_of_uid) {
-  PasswordEntry entry(uid);
-  if (!entry.Valid()) {
+    uint32_t uid, const std::string& target_user, bool read_only_priv,
+    User::AdminLevel* level_of_uid) {
+  PasswordEntry source_user_entry(uid);
+  if (!source_user_entry.Valid()) {
     return Result{false, fmt::format("Uid {} not existed", uid)};
   }
 
   util::read_lock_guard user_guard(m_rw_user_mutex_);
   util::read_lock_guard account_guard(m_rw_account_mutex_);
 
-  const User* ptr = GetExistedUserInfoNoLock_(entry.Username());
-  if (!ptr) {
-    return Result{false,
-                  fmt::format("Parameter error: User '{}' is not a crane user",
-                              entry.Username())};
-  }
-  const User* user_ptr = GetExistedUserInfoNoLock_(user);
-  if (!user_ptr) {
-    return Result{
-        false,
-        fmt::format("Parameter error: User '{}' is not a crane user", user)};
-  }
+  const User* source_user_ptr =
+      GetExistedUserInfoNoLock_(source_user_entry.Username());
+  if (!source_user_ptr)
+    return Result{false, fmt::format("User {} is not a user of Crane",
+                                     source_user_entry.Username())};
 
-  if (level_of_uid != nullptr) *level_of_uid = ptr->admin_level;
-  if (ptr->admin_level != User::None || user == entry.Username())
+  const User* target_user_ptr = GetExistedUserInfoNoLock_(target_user);
+  if (!target_user_ptr)
+    return Result{false,
+                  fmt::format("User {} is not a user of Crane", target_user)};
+
+  if (level_of_uid != nullptr) *level_of_uid = source_user_ptr->admin_level;
+
+  if (source_user_ptr->admin_level != User::None ||
+      target_user == source_user_entry.Username())
     return Result{true};
 
-  for (const auto& [user_acc, item] : user_ptr->account_to_attrs_map)
-    for (const auto& uid_acc : ptr->coordinator_accounts) {
-      if (uid_acc == user_acc || PaternityTestNoLock_(uid_acc, user_acc)) {
-        return Result{true};
-      }
-    }
+  std::vector<std::string> accounts_under_permission_vec;
+  if (read_only_priv)
+    for (const auto& [acc, acct_item] : source_user_ptr->account_to_attrs_map)
+      accounts_under_permission_vec.emplace_back(acc);
+  else
+    for (const auto& acc : source_user_ptr->coordinator_accounts)
+      accounts_under_permission_vec.emplace_back(acc);
 
-  return Result{
-      false,
-      fmt::format("Permission error: User '{}' don't have the permission to "
-                  "manager user '{}' which not in subtree of its accounts",
-                  entry.Username(), user)};
+  for (const auto& [target_user_acc, item] :
+       target_user_ptr->account_to_attrs_map) {
+    for (const auto& acc_under_perm : accounts_under_permission_vec)
+      if (acc_under_perm == target_user_acc ||
+          PaternityTestNoLock_(acc_under_perm, target_user_acc))
+        return Result{true};
+  }
+
+  return Result{false, fmt::format("User {} is not permitted to access user {} "
+                                   "out of subtrees of his permitted accounts",
+                                   source_user_entry.Username(), target_user)};
 }
 
 void AccountManager::InitDataMap_() {
@@ -1943,6 +1964,16 @@ AccountManager::Result AccountManager::DeleteAccountAllowedPartition_(
     return Result{false, fmt::format("Unknown account '{}'", name)};
   }
 
+  if (std::find(account->allowed_partition.begin(),
+                account->allowed_partition.end(),
+                partition) == account->allowed_partition.end()) {
+    return Result{
+        false,
+        fmt::format(
+            "Partition '{}' not in allowed partition list of account '{}'",
+            partition, name)};
+  }
+
   if (!force && IsAllowedPartitionOfAnyNodeNoLock_(account, partition)) {
     return Result{
         false, fmt::format(
@@ -1976,10 +2007,9 @@ AccountManager::Result AccountManager::DeleteAccountAllowedQos_(
     return Result{false, fmt::format("Unknown account '{}'", name)};
   }
 
-  auto iter = std::find(account->allowed_qos_list.begin(),
-                        account->allowed_qos_list.end(), qos);
-
-  if (iter == account->allowed_qos_list.end()) {
+  if (std::find(account->allowed_qos_list.begin(),
+                account->allowed_qos_list.end(),
+                qos) == account->allowed_qos_list.end()) {
     return Result{
         false, fmt::format("Qos '{}' is not in account '{}''s allowed qos list",
                            qos, name)};
