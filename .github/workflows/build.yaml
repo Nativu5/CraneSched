@@ -11,6 +11,15 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - name: test
+      - run: |
+          hostname
+          whoami
+          pwd
+    
   build:
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
