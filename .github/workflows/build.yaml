@@ -22,19 +22,20 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with: 
-          path: CraneSched
+          path: ${{ github.workspace }}/CraneSched
 
       # Checkout frontend
       - name: Checkout frontend
         uses: actions/checkout@v4
         with:
           repository: PKUHPC/CraneSched-FrontEnd
-          path: CraneSched-FrontEnd
+          path: ${{ github.workspace }}/CraneSched-FrontEnd
       
       # Pull CI Image and get external scripts
       - name: Pull CI Image
         run: |
           pwd
+          cd ${{ github.workspace }}
           podman pull ghcr.io/nativu5/cranedev:ci
           cp -r ../script . 
 
