@@ -10,6 +10,9 @@ on:
       - release/*
   workflow_dispatch:
 
+env:
+  SCRIPT_PATH: ${{ github.workspace }}/../../script
+
 jobs:
   build:
     runs-on: self-hosted
@@ -34,10 +37,9 @@ jobs:
       # Pull CI Image and get external scripts
       - name: Pull CI Image
         run: |
-          pwd
           cd ${{ github.workspace }}
           podman pull ghcr.io/nativu5/cranedev:ci
-          cp -r ../script . 
+          cp -r ${{ env.SCRIPT_PATH }} script
 
       - name: Run Build and Packaging in Container
         run: |
