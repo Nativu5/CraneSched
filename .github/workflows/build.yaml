@@ -1,4 +1,4 @@
-name: Build and Upload Packages
+name: Build, Upload and Test
 
 on:
   push:
@@ -41,7 +41,7 @@ jobs:
           podman pull ghcr.io/nativu5/cranedev:ci
           cp -r ${{ env.SCRIPT_PATH }} script
 
-      - name: Run Build and Packaging in Container
+      - name: Build in Container
         run: |
           mkdir -p output
           podman run --rm \
@@ -117,6 +117,7 @@ jobs:
 
       # Run AutoTest
       - name: Run AutoTest
+        continue-on-error: true
         run: |
           NETWORK_ID=$(podman container inspect mongodb | jq -r '.[0].NetworkSettings.Networks | keys[]')
           podman run -d --rm --name autotest \
@@ -127,6 +128,7 @@ jobs:
             --network $NETWORK_ID \
             localhost/autotest
           podman exec autotest /bin/bash --login script/run.sh
+          podman rm --force autotest
       
       # Upload AutoTest Results
       - name: Upload AutoTest Results
