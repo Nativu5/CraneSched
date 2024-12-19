@@ -21,16 +21,20 @@ jobs:
       # Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
+        with: 
+          path: CraneSched
 
       # Checkout frontend
       - name: Checkout frontend
-        run: | 
-          cd ..
-          git -c protocol.version=1 clone --depth=1 https://github.com/PKUHPC/CraneSched-FrontEnd.git
+        uses: actions/checkout@v4
+        with:
+          repository: PKUHPC/CraneSched-FrontEnd
+          path: CraneSched-FrontEnd
       
       # Pull CI Image and get external scripts
       - name: Pull CI Image
         run: |
+          pwd
           podman pull ghcr.io/nativu5/cranedev:ci
           cp -r ../script . 
 
