@@ -26,7 +26,7 @@ jobs:
       - name: Checkout frontend
         run: | 
           cd ..
-          git clone https://github.com/PKUHPC/CraneSched-FrontEnd.git
+          git -c protocol.version=1 clone --depth=1 https://github.com/PKUHPC/CraneSched-FrontEnd.git
       
       # Pull CI Image and get external scripts
       - name: Pull CI Image
