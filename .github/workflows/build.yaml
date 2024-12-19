@@ -21,7 +21,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Pull CI Docker Image
+      - name: TEST CI
+        run: bash -c "pwd; touch I_AM_HERE; sleep 30"
+
+      - name: Pull CI Image
         run: |
           docker pull ghcr.io/nativu5/cranedev:ci
 
@@ -31,7 +34,7 @@ jobs:
             -v $(pwd):/workspace \
             -w /workspace \
             ghcr.io/nativu5/cranedev:ci \
-            /bin/bash -c "
+            /bin/bash --login -c "
               echo \"Configuring at \$(pwd)\" && \
               mkdir -p out && \
               cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCRANE_FULL_DYNAMIC=OFF -S . -B out && \
