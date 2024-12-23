@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  SCRIPT_PATH: ${{ github.workspace }}/../../script
+  SCRIPT_PATH: /opt/actions-runner-external/script
 
 jobs:
   build:
