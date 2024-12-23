@@ -9,12 +9,18 @@ on:
       - master
       - release/*
   workflow_dispatch:
+    inputs:
+      frontend_branch:
+        description: 'Branch of FrontEnd to use'
+        required: true
+        default: 'main'
 
 env:
   SCRIPT_PATH: /opt/actions-runner-external/script
 
 jobs:
   build:
+    if: github.event.pull_request.draft == false
     runs-on: self-hosted
     defaults:
       run:
@@ -25,21 +31,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with: 
-          path: ${{ github.workspace }}/CraneSched
+          path: CraneSched
 
       # Checkout frontend
       - name: Checkout frontend
         uses: actions/checkout@v4
         with:
           repository: PKUHPC/CraneSched-FrontEnd
-          path: ${{ github.workspace }}/CraneSched-FrontEnd
+          path: CraneSched-FrontEnd
+          ref: ${{ inputs.frontend_branch }}
       
       # Pull CI Image and get external scripts
       - name: Pull CI Image
         run: |
-          cd ${{ github.workspace }}
           podman pull ghcr.io/nativu5/cranedev:ci
-          cp -r ${{ env.SCRIPT_PATH }} script
+          cp -r ${{ env.SCRIPT_PATH }} .
 
       - name: Build in Container
         run: |
@@ -54,10 +60,10 @@ jobs:
       # Collect and upload artifacts
       - name: Count Artifacts
         run: |
-          ARTIFACT_NAME_CRANED_DEB=$(basename $(ls output/*craned.rpm))
-          ARTIFACT_NAME_CRANED_RPM=$(basename $(ls output/*craned.deb))
-          ARTIFACT_NAME_CRANECTLD_DEB=$(basename $(ls output/*cranectld.rpm))
-          ARTIFACT_NAME_CRANECTLD_RPM=$(basename $(ls output/*cranectld.deb))
+          ARTIFACT_NAME_CRANED_DEB=$(basename $(ls output/*craned.deb))
+          ARTIFACT_NAME_CRANED_RPM=$(basename $(ls output/*craned.rpm))
+          ARTIFACT_NAME_CRANECTLD_DEB=$(basename $(ls output/*cranectld.deb))
+          ARTIFACT_NAME_CRANECTLD_RPM=$(basename $(ls output/*cranectld.rpm))
           ARTIFACT_NAME_FRONTEND=bin
           ARTIFACT_NAME_PLUGIN=plugin
           echo "ARTIFACT_NAME_CRANED_DEB=$ARTIFACT_NAME_CRANED_DEB" >> $GITHUB_ENV
@@ -119,7 +125,7 @@ jobs:
       - name: Run AutoTest
         continue-on-error: true
         run: |
-          NETWORK_ID=$(podman container inspect mongodb | jq -r '.[0].NetworkSettings.Networks | keys[]')
+          NETWORK_ID=$(podman network inspect -f '{{.Name}}' | grep bridge)
           podman run -d --rm --name autotest \
             --privileged \
             --systemd true \
@@ -127,8 +133,14 @@ jobs:
             -v ./output:/CraneSched-AutoTest/output \
             --network $NETWORK_ID \
             localhost/autotest
-          podman exec autotest /bin/bash --login script/run.sh
-          podman rm --force autotest
+          if podman exec autotest /bin/bash --login script/run.sh; then
+            echo "Tests passed."
+          else
+            echo "Tests failed. Stopping container." >&2
+            podman stop autotest
+            exit 1
+          fi
+          podman stop autotest
       
       # Upload AutoTest Results
       - name: Upload AutoTest Results
