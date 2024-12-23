@@ -13,7 +13,7 @@ on:
       frontend_branch:
         description: 'Branch of FrontEnd to use'
         required: true
-        default: 'main'
+        default: 'master'
 
 env:
   SCRIPT_PATH: /opt/actions-runner-external/script
@@ -45,7 +45,7 @@ jobs:
       - name: Pull CI Image
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
-          cp -r ${{ env.SCRIPT_PATH }} .
+          ln -sf /opt/actions-runner-external/script script
 
       - name: Build in Container
         run: |
