@@ -41,15 +41,16 @@ jobs:
           path: CraneSched-FrontEnd
           ref: ${{ inputs.frontend_branch }}
       
-      # Pull CI Image and get external scripts
+      # Pull CI Image and Prepare
       - name: Pull CI Image
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
           ln -sf /opt/actions-runner-external/script script
+          mkdir -p output
+          mkdir -p log
 
       - name: Build in Container
         run: |
-          mkdir -p output
           podman run --rm \
               -v ./CraneSched:/Workspace/CraneSched \
               -v ./CraneSched-FrontEnd:/Workspace/CraneSched-FrontEnd \
