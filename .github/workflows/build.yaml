@@ -125,7 +125,7 @@ jobs:
       - name: Run AutoTest
         continue-on-error: true
         run: |
-          NETWORK_ID=$(podman network inspect -f '{{.Name}}' | grep bridge)
+          NETWORK_ID=$(podman container inspect mongodb | jq -r '.[0].NetworkSettings.Networks | keys[]')
           podman run -d --rm --name autotest \
             --privileged \
             --systemd true \
