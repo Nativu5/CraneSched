@@ -78,7 +78,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME_CRANED_DEB }}
           path: output/${{ env.ARTIFACT_NAME_CRANED_DEB }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
 
       - name: Upload craned .rpm package
@@ -86,7 +86,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME_CRANED_RPM }}
           path: output/${{ env.ARTIFACT_NAME_CRANED_RPM }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
 
       - name: Upload cranectld .deb package
@@ -94,7 +94,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME_CRANECTLD_DEB }}
           path: output/${{ env.ARTIFACT_NAME_CRANECTLD_DEB }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
 
       - name: Upload cranectld .rpm package
@@ -102,7 +102,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME_CRANECTLD_RPM }}
           path: output/${{ env.ARTIFACT_NAME_CRANECTLD_RPM }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
 
       - name: Upload frontend
@@ -110,7 +110,7 @@ jobs:
         with:
           name: frontend
           path: output/${{ env.ARTIFACT_NAME_FRONTEND }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
       
       - name: Upload plugin
@@ -118,7 +118,7 @@ jobs:
         with:
           name: plugin
           path: output/${{ env.ARTIFACT_NAME_PLUGIN }}
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
 
       # Run AutoTest
@@ -130,7 +130,9 @@ jobs:
             --privileged \
             --systemd true \
             -v /lib/modules:/lib/modules:ro \
+            -v ./script:/CraneSched-AutoTest/script \
             -v ./output:/CraneSched-AutoTest/output \
+            -v ./log:/CraneSched-AutoTest/log \
             --network $NETWORK_ID \
             localhost/autotest
           if podman exec autotest /bin/bash --login script/run.sh; then
@@ -148,5 +150,5 @@ jobs:
         with:
           name: result.json
           path: output/result.json
-          retention-days: 30
+          retention-days: 14
           if-no-files-found: error
