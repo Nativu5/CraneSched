@@ -47,6 +47,8 @@ jobs:
       - name: Pull CI Image
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
+          echo "Linking $SCIRPT_PATH to $(pwd)/script"
+          echo "Linking $CACHE_PATH to $(pwd)/cache"
           ln -sfT $SCIRPT_PATH $(pwd)/script
           ln -sfT $CACHE_PATH $(pwd)/cache
           mkdir -p output
