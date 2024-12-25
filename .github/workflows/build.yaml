@@ -48,8 +48,8 @@ jobs:
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
           echo "Linking $SCRIPT_PATH to $(pwd)/script"
+          ln -sfT $SCRIPT_PATH $(pwd)/script
           echo "Linking $CACHE_PATH to $(pwd)/cache"
-          ln -sfT $SCIRPT_PATH $(pwd)/script
           ln -sfT $CACHE_PATH $(pwd)/cache
           mkdir -p output
           mkdir -p log
