@@ -17,6 +17,7 @@ on:
 
 env:
   SCRIPT_PATH: /opt/actions-runner-external/script
+  TEST_FAILED: false
 
 jobs:
   build:
@@ -136,13 +137,7 @@ jobs:
             -v ./log:/CraneSched-AutoTest/log \
             --network $NETWORK_ID \
             localhost/autotest
-          if podman exec autotest /bin/bash --login script/run.sh; then
-            echo "Tests passed."
-          else
-            echo "Tests failed. Stopping container." >&2
-            podman stop autotest
-            exit 1
-          fi
+          podman exec autotest /bin/bash --login script/run.sh || echo "TEST_FAILED=true" >> $GITHUB_ENV
           podman stop autotest
       
       # Upload AutoTest Results
@@ -153,3 +148,8 @@ jobs:
           path: output/result.json
           retention-days: 14
           if-no-files-found: error
+
+      # Alarm if has failed cases
+      - name: Alarm on test failure
+        if: ${{ env.TEST_FAILED }} == 'true'
+        run: exit 1
