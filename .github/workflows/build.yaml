@@ -17,6 +17,7 @@ on:
 
 env:
   SCRIPT_PATH: /opt/actions-runner-external/script
+  CACHE_PATH: /opt/actions-runner-external/cache
   TEST_FAILED: false
 
 jobs:
@@ -46,7 +47,8 @@ jobs:
       - name: Pull CI Image
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
-          ln -sf /opt/actions-runner-external/script script
+          ln -sf $SCIRPT_PATH script
+          ln -sf $CACHE_PATH cache
           mkdir -p output
           mkdir -p log
 
@@ -57,6 +59,7 @@ jobs:
               -v ./CraneSched-FrontEnd:/Workspace/CraneSched-FrontEnd \
               -v ./output:/Workspace/output \
               -v ./script:/Workspace/script \
+              -v ./cache/ccache:/root/.ccache \
               ghcr.io/nativu5/cranedev:ci /bin/bash --login script/build.sh
 
       # Collect and upload artifacts
