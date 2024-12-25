@@ -47,8 +47,8 @@ jobs:
       - name: Pull CI Image
         run: |
           podman pull ghcr.io/nativu5/cranedev:ci
-          ln -sf $SCIRPT_PATH script
-          ln -sf $CACHE_PATH cache
+          ln -sfT $SCIRPT_PATH $(pwd)/script
+          ln -sfT $CACHE_PATH $(pwd)/cache
           mkdir -p output
           mkdir -p log
 
