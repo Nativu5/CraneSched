@@ -156,5 +156,5 @@ jobs:
 
       # Alarm if has failed cases
       - name: Alarm on test failure
-        if: ${{ env.TEST_FAILED }} == 'true'
+        if: env.TEST_FAILED == 'true'
         run: exit 1
